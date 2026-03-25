@@ -91,6 +91,12 @@ class ScoredTensorQueue:
             return torch.empty(0, device=self.device), torch.empty(0, device=self.device)
         tensors, scores = zip(*self.queue)
         return torch.stack(tensors), torch.tensor(scores, device=self.device)
+    def get_latest_n(self, n):
+
+        if not self.queue:
+            return torch.empty(0, device=self.device)
+        latest_tensors = [t for t, _ in list(self.queue)[-n:]]
+        return torch.stack(latest_tensors)
     
     def __len__(self):
         return len(self.queue)
@@ -99,3 +105,6 @@ class ScoredTensorQueue:
         self.queue.clear()
 
 short_memory = ScoredTensorQueue(maxlen=50, device='cpu')
+
+
+
