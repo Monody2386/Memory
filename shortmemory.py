@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
-from relation_map import noun_number, noun_dim, relation_num, relation_map, lr_per_embedding
-
+from train_relation_map import noun_number, noun_dim,  relation_map, lr_per_embedding
+from relation_map import relation_map, relation_num
 class inf_concat(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(inf_concat, self).__init__()
@@ -51,13 +51,10 @@ class ScoredTensorQueue:
         self.device = device
         self.queue = deque()  # 存储 (tensor, score) 元组
     
-    def append(self, tensor, score=0.0):
-        """
-        添加一个张量和对应的 score
-        """
+    def append(self, tensor, score=0.0, noun_type=None, action_type=None):
         tensor = tensor.to(self.device)
-        self.queue.append((tensor, score))
-        # 保持队列长度
+        self.queue.append((tensor, score, noun_type, action_type))
+        
         while len(self.queue) > self.maxlen:
             self.queue.popleft()
     
@@ -84,27 +81,51 @@ class ScoredTensorQueue:
             raise ValueError("mode must be 'ge' or 'le'")
     
     def get_stack(self):
-        """
-        返回堆叠后的 tensor 和 scores
-        """
         if len(self.queue) == 0:
-            return torch.empty(0, device=self.device), torch.empty(0, device=self.device)
-        tensors, scores = zip(*self.queue)
-        return torch.stack(tensors), torch.tensor(scores, device=self.device)
+            return (
+                torch.empty(0, device=self.device),
+                torch.empty(0, device=self.device),
+                [],
+                []
+            )
+        
+        tensors, scores, noun_types, action_types = zip(*self.queue)
+    
+        return (
+            torch.stack(tensors),
+            torch.tensor(scores, device=self.device),
+            list(noun_types),
+            list(action_types)
+        )
     def get_latest_n(self, n):
-
         if not self.queue:
             return torch.empty(0, device=self.device)
-        latest_tensors = [t for t, _ in list(self.queue)[-n:]]
-        return torch.stack(latest_tensors)
+        
+        latest = list(self.queue)[-n:]
+        tensors = [t for t, _, _, _ in latest]
+        
+        return torch.stack(tensors)
     
     def __len__(self):
         return len(self.queue)
+    
+    def filter_by_type(self, noun_type=None, action_type=None):
+        new_queue = []
+        
+        for t, s, n, a in self.queue:
+            if noun_type is not None and n != noun_type:
+                continue
+            if action_type is not None and a != action_type:
+                continue
+            new_queue.append((t, s, n, a))
+        
+        self.queue = deque(new_queue)
     
     def clear(self):
         self.queue.clear()
 
 short_memory = ScoredTensorQueue(maxlen=50, device='cpu')
+
 
 
 
