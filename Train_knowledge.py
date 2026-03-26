@@ -5,33 +5,31 @@ import os
 import torch
 
 import relation_map as rm
-from Feed_relations import begin_feed_training, end_feed_training, random_feed
+from Feed_relations import begin_feed_training, end_feed_training, random_feed, run_long_training_and_save
 from train_relation_map import knowledge_map
 
 MODEL_PATH = "knowledge_map_one.pt"
 
 
-def train_via_feed_relations(num_steps: int = 100, seed: Optional[int] = None):
+def train_via_feed_relations(relations):
     """
     feed_relation 多轮训练流程：
     1. 开始训练：载入模型参数 + relation_data（只发生一次）
     2. 多轮 random_feed：反复更新模型参数与学习率（不落盘）
     3. 训练结束：统一保存 relation_data + 模型参数（只落盘一次）
     """
-    if seed is not None:
-        random.seed(seed)
 
     begin_feed_training()
 
     if not rm.noun_list:
-        raise ValueError("noun_list 为空：请先准备/落盘 relation_data.npz。")
+        raise ValueError("noun_list is empty relation_data.npz。")
     if not rm.relation_list:
-        raise ValueError("relation_list 为空：请先准备/落盘 relation_data.npz。")
+        raise ValueError("relation_list is empty relation_data.npz。")
 
-    for _ in range(num_steps):
-        noun1 = random.choice(rm.noun_list)
-        noun2 = random.choice(rm.noun_list)
-        relation = random.choice(rm.relation_list)
+    for i in range(len(relations)):
+        noun1 = relations[i][0]
+        noun2 = relations[i][1]
+        relation = relations[i][2]
         random_feed(noun1, noun2, relation)
 
     end_feed_training()
@@ -52,19 +50,19 @@ def predict_next_word(word: str, relation, top_k: int = 5):
     # rm.ensure_relation_defaults()
 
     if word not in rm.noun_list:
-        raise ValueError(f"输入词 `{word}` 不在 rm.noun_list 中。")
+        raise ValueError(f"word{word}not in rm.noun_list")
 
     if isinstance(relation, str):
         if relation not in rm.relation_list:
-            raise ValueError(f"关系 `{relation}` 不在 rm.relation_list 中。")
-        relation_type = rm.relation_list.index(relation)
+            raise ValueError(f"{relation}not in rm.relation_list")
+        relation_type = rm.relation_list.index(relation) + 1
     elif isinstance(relation, int):
         relation_type = relation
     else:
-        raise TypeError("relation 需要是字符串（关系名）或整数（relation_type）。")
+        raise TypeError("relation should be int (relation_type)")
 
     if not (1 <= relation_type <= 5):
-        raise ValueError("relation_type 需要在 1..5 之间（0 是无关系占位，不可用）。")
+        raise ValueError("relation_type should betwwen 1 and 5")
 
     if not torch.cuda.is_available():
         device = "cpu"
@@ -73,7 +71,7 @@ def predict_next_word(word: str, relation, top_k: int = 5):
 
     model = knowledge_map(rm.noun_dim, rm.noun_dim)
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"找不到已训练模型文件：{MODEL_PATH}")
+        raise FileNotFoundError(f"{MODEL_PATH}")
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
 
@@ -98,5 +96,12 @@ def predict_next_word(word: str, relation, top_k: int = 5):
 
 
 if __name__ == "__main__":
-    predict_next_word("banana", "include")
+
+
+    relations = [("apple", "fruit", "include")]
+
+    train_via_feed_relations(relations)
+    print(predict_next_word("banana", "include"))
+    run_long_training_and_save()
+
 
