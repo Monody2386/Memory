@@ -28,6 +28,7 @@ class knowledge_map(nn.Module):
         elif relation_type == 5:
             y = self.relations[4](x)   
         return y, target
+    
     def query_similarity(self, query_tensor, top_k=5):
         """
         输入查询 tensor，计算与 embedding 层所有向量的余弦相似度
@@ -50,6 +51,9 @@ class knowledge_map(nn.Module):
         top_scores, top_indices = torch.topk(similarity, k=top_k)
 
         return top_indices, top_scores
+    
+
+
     def query_relation_by_tensor(self, query_tensor, top_k=1):
         """
         输入一个 tensor，找到最相似的 relation（基于 linear weight）
