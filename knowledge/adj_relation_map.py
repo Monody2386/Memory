@@ -11,6 +11,9 @@ adj_relation_num = 5
 DEFAULT_ADJECTIVES = [
     "red",
     "round",
+
+
+    
     "sweet",
     "large",
     "smooth",
