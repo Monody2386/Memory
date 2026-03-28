@@ -32,7 +32,7 @@ def build_demo_memory(model: WorldModel) -> ScoredTensorQueue:
             noun_embedding=noun_embedding,
             action_embedding=model.get_action_embedding(action_type).detach().clone(),
             score=1.0,
-            noun_type="demo_noun",
+            noun_type=11,
             action_type=action_type,
         )
 
@@ -154,7 +154,7 @@ def run_demo(
         noun_embedding=next_noun_embedding,
         action_type=train_action_type,
         score=1.0,
-        noun_type="rollout_noun",
+        noun_type=19,
     )
     print("Autoregressive step")
     print(
@@ -169,3 +169,4 @@ def run_demo(
 
 if __name__ == "__main__":
     run_demo()
+

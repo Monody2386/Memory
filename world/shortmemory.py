@@ -24,7 +24,7 @@ def update_relation_map(relation_map, i, j, relation_type):
 class MemoryEntry:
     tensor: torch.Tensor
     score: float
-    noun_type: Optional[str]
+    noun_type: Optional[int]
     action_type: Optional[int]
     time_position: int
     pair_index: int
@@ -36,11 +36,19 @@ class ShortMemory:
     def __init__(self, maxlen=100, device="cpu", state_dim=None):
         self.maxlen = maxlen
         self.device = device
-        self.state_dim = state_dim or (noun_dim + 80)
+        self.state_dim = state_dim
         self.entries = []
         self._insert_counter = 0
 
+    def _resolve_state_dim(self, noun_embedding: torch.Tensor, action_embedding: torch.Tensor) -> int:
+        candidate_dim = noun_embedding.view(-1).numel() + action_embedding.view(-1).numel()
+        if self.state_dim is None:
+            self.state_dim = candidate_dim
+        return self.state_dim
+
     def _sinusoidal_position_encoding(self, time_position: int, pair_index: int) -> torch.Tensor:
+        if self.state_dim is None:
+            raise ValueError("state_dim is unknown; append at least one state first")
         position_value = float(time_position) * 1000.0 + float(pair_index)
         encoding = torch.zeros(self.state_dim, device=self.device, dtype=torch.float32)
         div_term = torch.exp(
@@ -60,10 +68,11 @@ class ShortMemory:
     ) -> torch.Tensor:
         noun_embedding = noun_embedding.to(self.device).view(-1)
         action_embedding = action_embedding.to(self.device).view(-1)
+        expected_dim = self._resolve_state_dim(noun_embedding, action_embedding)
         state_tensor = torch.cat([noun_embedding, action_embedding], dim=0)
-        if state_tensor.numel() != self.state_dim:
+        if state_tensor.numel() != expected_dim:
             raise ValueError(
-                f"state tensor must have {self.state_dim} values, got {state_tensor.numel()}"
+                f"state tensor must have {expected_dim} values, got {state_tensor.numel()}"
             )
         return state_tensor + self._sinusoidal_position_encoding(time_position, pair_index)
 
@@ -104,8 +113,8 @@ class ShortMemory:
         entry = MemoryEntry(
             tensor=encoded_tensor,
             score=float(score),
-            noun_type=noun_type,
-            action_type=action_type,
+            noun_type=None if noun_type is None else int(noun_type),
+            action_type=None if action_type is None else int(action_type),
             time_position=int(time_position),
             pair_index=int(pair_index),
             noun_embedding=noun_embedding.to(self.device).view(-1),
@@ -132,7 +141,10 @@ class ShortMemory:
 
     def boost_related(self, noun_type=None, action_type=None, amount=1.0):
         if noun_type is None and action_type is None:
-            raise ValueError("Provide noun_type or action_type to boost")
+            raise ValueError("Provide noun_type index or action_type to boost")
+
+        noun_type = None if noun_type is None else int(noun_type)
+        action_type = None if action_type is None else int(action_type)
 
         for entry in self.entries:
             matched = False
@@ -187,6 +199,8 @@ class ShortMemory:
         return len(self.entries)
 
     def filter_by_type(self, noun_type=None, action_type=None):
+        noun_type = None if noun_type is None else int(noun_type)
+        action_type = None if action_type is None else int(action_type)
         kept = []
         for entry in self.entries:
             if noun_type is not None and entry.noun_type != noun_type:
