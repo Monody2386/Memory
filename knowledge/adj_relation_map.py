@@ -4,16 +4,13 @@ import numpy as np
 
 import knowledge.relation_map as noun_rm
 
-adjective_number = 500
+adjective_number = 200
 adjective_dim = noun_rm.noun_dim
-adj_relation_num = 5
+adj_relation_num = 7
 
 DEFAULT_ADJECTIVES = [
     "red",
     "round",
-
-
-    
     "sweet",
     "large",
     "smooth",
@@ -25,6 +22,8 @@ DEFAULT_ADJ_RELATIONS = [
     "taste",
     "size",
     "texture",
+    "personality",
+    "temperature",
 ]
 
 adj_relation_map = np.zeros((noun_rm.noun_number, adjective_number), dtype=np.int64)

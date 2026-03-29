@@ -40,7 +40,7 @@ def train_adj_random(adj_map_one, noun_idx, adjective_idx, relation_type, lr_per
     rel_idx = int(relation_type) - 1
     if rel_idx < 0 or rel_idx >= len(adj_map_one.relations):
         raise ValueError(f"relation_type={relation_type} exceeds adjective relation capacity")
-
+ 
     noun_idx = int(noun_idx)
     adjective_idx = int(adjective_idx)
     noun_tensor = torch.tensor(noun_idx, dtype=torch.long, device=device)
