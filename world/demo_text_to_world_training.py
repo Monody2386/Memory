@@ -7,6 +7,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from Grammar import sentences_to_short_memory
+from knowledge.training import train_sentence_online
 from world.shortmemory import ShortMemory
 from world.world_model import (
     WorldModel,
@@ -16,6 +17,20 @@ from world.world_model import (
     noun_dim,
     value_dim,
 )
+
+
+SENTENCE_SPECS = [
+    {
+        "sentence": "I cut red apple",
+        "noun_relation_type": 1,
+        "adjective_relation_types": {"red": "color"},
+    },
+    {
+        "sentence": "cat eat sweet apple",
+        "noun_relation_type": 1,
+        "adjective_relation_types": {"sweet": "taste"},
+    },
+]
 
 
 def build_demo_model() -> WorldModel:
@@ -29,17 +44,38 @@ def build_demo_model() -> WorldModel:
     )
 
 
-def build_demo_memory(world_model: WorldModel) -> ShortMemory:
+def apply_online_language_updates(sentence_specs):
+    print("Online knowledge updates")
+    update_logs = []
+    for spec in sentence_specs:
+        samples, results = train_sentence_online(
+            spec["sentence"],
+            noun_relation_type=spec.get("noun_relation_type"),
+            adjective_relation_types=spec.get("adjective_relation_types"),
+            infer_missing=False,
+            save=False,
+        )
+        summary = {
+            "sentence": spec["sentence"],
+            "noun_noun_updates": len(samples.noun_noun_samples),
+            "adj_noun_updates": len(samples.adj_noun_samples),
+            "noun_losses": [round(item["loss"], 8) for item in results["noun_noun"]],
+            "adj_losses": [round(item["loss"], 8) for item in results["adj_noun"]],
+        }
+        update_logs.append(summary)
+        print(summary)
+    return update_logs
+
+
+def build_demo_memory(world_model: WorldModel, sentence_specs) -> ShortMemory:
     memory = ShortMemory()
     sentences_to_short_memory(
-        [
-            "I cut red apple",
-            "cat eat sweet apple",
-        ],
+        [spec["sentence"] for spec in sentence_specs],
         short_memory=memory,
         world_model=world_model,
         start_time_position=0,
         base_score=1.0,
+        adjective_relation_types=[spec.get("adjective_relation_types") for spec in sentence_specs],
     )
     return memory
 
@@ -81,8 +117,9 @@ def print_memory(memory: ShortMemory):
 def run_demo(num_epochs: int = 100, print_every: int = 20):
     torch.manual_seed(11)
 
+    apply_online_language_updates(SENTENCE_SPECS)
     world_model = build_demo_model()
-    memory = build_demo_memory(world_model)
+    memory = build_demo_memory(world_model, SENTENCE_SPECS)
     optimizer = torch.optim.Adam(
         [
             {"params": world_model.action_models.parameters(), "lr": 1e-2},

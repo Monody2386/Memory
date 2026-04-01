@@ -2,12 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._training_utils import (
+    decay_learning_rates,
+    iter_active_relations,
+    relation_type_to_index,
+    scale_relation_gradients,
+    scale_row_gradients,
+)
 from .adj_relation_map import adjective_number, adj_relation_num, save_adj_relation_data
 
 
 class adj_map(nn.Module):
     def __init__(self, shared_noun_embedding, input_dim, output_dim):
-        super(adj_map, self).__init__()
+        super().__init__()
         self.embedding = shared_noun_embedding
         self.adjective_embedding = nn.Embedding(adjective_number, input_dim)
         self.relations = nn.ModuleList(
@@ -15,10 +22,7 @@ class adj_map(nn.Module):
         )
 
     def forward(self, noun_index, adjective_index, relation_type):
-        rel_idx = int(relation_type) - 1
-        if rel_idx < 0 or rel_idx >= len(self.relations):
-            raise ValueError(f"relation_type must be in [1, {len(self.relations)}]")
-
+        rel_idx = relation_type_to_index(relation_type, len(self.relations))
         noun_emb = self.embedding(noun_index)
         adjective_target = self.adjective_embedding(adjective_index)
         adjective_pred = self.relations[rel_idx](noun_emb)
@@ -35,12 +39,18 @@ class adj_map(nn.Module):
         return top_indices, top_scores
 
 
-def train_adj_random(adj_map_one, noun_idx, adjective_idx, relation_type, lr_per_embedding, lr_per_adjective, lr_adj_relation):
+def train_adj_random(
+    adj_map_one,
+    noun_idx,
+    adjective_idx,
+    relation_type,
+    lr_per_embedding,
+    lr_per_adjective,
+    lr_adj_relation,
+):
     device = next(adj_map_one.parameters()).device
-    rel_idx = int(relation_type) - 1
-    if rel_idx < 0 or rel_idx >= len(adj_map_one.relations):
-        raise ValueError(f"relation_type={relation_type} exceeds adjective relation capacity")
- 
+    rel_idx = relation_type_to_index(relation_type, len(adj_map_one.relations))
+
     noun_idx = int(noun_idx)
     adjective_idx = int(adjective_idx)
     noun_tensor = torch.tensor(noun_idx, dtype=torch.long, device=device)
@@ -53,6 +63,7 @@ def train_adj_random(adj_map_one, noun_idx, adjective_idx, relation_type, lr_per
     lr_decay_embedding = 0.95
     lr_decay_relation = 0.95
     min_lr = 1e-6
+    loss = None
 
     for _ in range(100):
         adj_map_one.zero_grad(set_to_none=True)
@@ -73,11 +84,10 @@ def train_adj_random(adj_map_one, noun_idx, adjective_idx, relation_type, lr_per
             if rel_grad is not None:
                 adj_map_one.relations[rel_idx].weight -= lr_rel * rel_grad
 
-    lr_per_embedding[noun_idx] = max(float(lr_per_embedding[noun_idx]) * lr_decay_embedding, min_lr)
-    lr_per_adjective[adjective_idx] = max(float(lr_per_adjective[adjective_idx]) * lr_decay_embedding, min_lr)
-    lr_adj_relation[rel_idx] = max(float(lr_adj_relation[rel_idx]) * lr_decay_relation, min_lr)
-
-    return loss.item()
+    decay_learning_rates(lr_per_embedding, [noun_idx], lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_per_adjective, [adjective_idx], lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_adj_relation, [rel_idx], lr_decay_relation, min_lr)
+    return float(loss.item()) if loss is not None else 0.0
 
 
 def train_adj_average(
@@ -97,57 +107,34 @@ def train_adj_average(
     optimizer.zero_grad()
     involved_nouns = set()
     involved_adjectives = set()
-    involved_relation_types = set()
+    involved_relation_indices = set()
 
-    for noun_idx in range(adj_relation_map.shape[0]):
-        for adjective_idx in range(adj_relation_map.shape[1]):
-            rt = adj_relation_map[noun_idx][adjective_idx]
-            if rt == 0:
-                continue
+    for noun_idx, adjective_idx, relation_type in iter_active_relations(
+        adj_relation_map,
+        len(adj_map_one.relations),
+    ):
+        involved_nouns.add(noun_idx)
+        involved_adjectives.add(adjective_idx)
+        rel_idx = relation_type_to_index(relation_type, len(adj_map_one.relations))
+        involved_relation_indices.add(rel_idx)
 
-            rt_i = int(rt)
-            if rt_i < 1 or rt_i > len(adj_map_one.relations):
-                continue
-
-            involved_nouns.add(noun_idx)
-            involved_adjectives.add(adjective_idx)
-            involved_relation_types.add(rt_i)
-
-            y_pred, y_target = adj_map_one(
-                torch.tensor(noun_idx), torch.tensor(adjective_idx), rt_i
-            )
-            loss = F.mse_loss(y_pred, y_target)
-            loss.backward()
+        y_pred, y_target = adj_map_one(
+            torch.tensor(noun_idx),
+            torch.tensor(adjective_idx),
+            relation_type,
+        )
+        loss = F.mse_loss(y_pred, y_target)
+        loss.backward()
 
     with torch.no_grad():
-        noun_grad = adj_map_one.embedding.weight.grad
-        if noun_grad is not None:
-            noun_lr = torch.tensor(
-                lr_per_embedding, device=noun_grad.device, dtype=noun_grad.dtype
-            ).unsqueeze(1)
-            noun_grad *= noun_lr
-
-        adjective_grad = adj_map_one.adjective_embedding.weight.grad
-        if adjective_grad is not None:
-            adjective_lr = torch.tensor(
-                lr_per_adjective, device=adjective_grad.device, dtype=adjective_grad.dtype
-            ).unsqueeze(1)
-            adjective_grad *= adjective_lr
-
-        for rel_idx in range(len(adj_map_one.relations)):
-            rel_grad = adj_map_one.relations[rel_idx].weight.grad
-            if rel_grad is not None:
-                rel_grad *= float(lr_adj_relation[rel_idx])
+        scale_row_gradients(adj_map_one.embedding.weight.grad, lr_per_embedding)
+        scale_row_gradients(adj_map_one.adjective_embedding.weight.grad, lr_per_adjective)
+        scale_relation_gradients(adj_map_one.relations, lr_adj_relation)
 
     optimizer.step()
-
-    for idx in involved_nouns:
-        lr_per_embedding[idx] = max(float(lr_per_embedding[idx]) * lr_decay_embedding, min_lr)
-    for idx in involved_adjectives:
-        lr_per_adjective[idx] = max(float(lr_per_adjective[idx]) * lr_decay_embedding, min_lr)
-    for rt_i in involved_relation_types:
-        rel_idx = rt_i - 1
-        lr_adj_relation[rel_idx] = max(float(lr_adj_relation[rel_idx]) * lr_decay_relation, min_lr)
+    decay_learning_rates(lr_per_embedding, involved_nouns, lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_per_adjective, involved_adjectives, lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_adj_relation, involved_relation_indices, lr_decay_relation, min_lr)
 
 
 def train_joint_average(
@@ -173,80 +160,53 @@ def train_joint_average(
 
     involved_nouns = set()
     involved_adjectives = set()
-    involved_knowledge_relations = set()
-    involved_adj_relations = set()
+    involved_knowledge_relation_indices = set()
+    involved_adj_relation_indices = set()
 
-    for noun_i in range(relation_map.shape[0]):
-        for noun_j in range(relation_map.shape[1]):
-            rt = relation_map[noun_i][noun_j]
-            if rt == 0:
-                continue
-            rt_i = int(rt)
-            if rt_i < 1 or rt_i > len(knowledge_map_one.relations):
-                continue
+    for noun_i, noun_j, relation_type in iter_active_relations(
+        relation_map,
+        len(knowledge_map_one.relations),
+    ):
+        involved_nouns.update((noun_i, noun_j))
+        rel_idx = relation_type_to_index(relation_type, len(knowledge_map_one.relations))
+        involved_knowledge_relation_indices.add(rel_idx)
 
-            involved_nouns.add(noun_i)
-            involved_nouns.add(noun_j)
-            involved_knowledge_relations.add(rt_i)
-            y_pred, y_target = knowledge_map_one(torch.tensor(noun_i), torch.tensor(noun_j), rt_i)
-            loss = F.mse_loss(y_pred, y_target)
-            loss.backward()
+        y_pred, y_target = knowledge_map_one(
+            torch.tensor(noun_i),
+            torch.tensor(noun_j),
+            relation_type,
+        )
+        loss = F.mse_loss(y_pred, y_target)
+        loss.backward()
 
-    for noun_idx in range(adj_relation_map.shape[0]):
-        for adjective_idx in range(adj_relation_map.shape[1]):
-            rt = adj_relation_map[noun_idx][adjective_idx]
-            if rt == 0:
-                continue
-            rt_i = int(rt)
-            if rt_i < 1 or rt_i > len(adj_map_one.relations):
-                continue
+    for noun_idx, adjective_idx, relation_type in iter_active_relations(
+        adj_relation_map,
+        len(adj_map_one.relations),
+    ):
+        involved_nouns.add(noun_idx)
+        involved_adjectives.add(adjective_idx)
+        rel_idx = relation_type_to_index(relation_type, len(adj_map_one.relations))
+        involved_adj_relation_indices.add(rel_idx)
 
-            involved_nouns.add(noun_idx)
-            involved_adjectives.add(adjective_idx)
-            involved_adj_relations.add(rt_i)
-            y_pred, y_target = adj_map_one(
-                torch.tensor(noun_idx), torch.tensor(adjective_idx), rt_i
-            )
-            loss = F.mse_loss(y_pred, y_target)
-            loss.backward()
+        y_pred, y_target = adj_map_one(
+            torch.tensor(noun_idx),
+            torch.tensor(adjective_idx),
+            relation_type,
+        )
+        loss = F.mse_loss(y_pred, y_target)
+        loss.backward()
 
     with torch.no_grad():
-        noun_grad = knowledge_map_one.embedding.weight.grad
-        if noun_grad is not None:
-            noun_lr = torch.tensor(
-                lr_per_embedding, device=noun_grad.device, dtype=noun_grad.dtype
-            ).unsqueeze(1)
-            noun_grad *= noun_lr
-
-        for rel_idx in range(len(knowledge_map_one.relations)):
-            rel_grad = knowledge_map_one.relations[rel_idx].weight.grad
-            if rel_grad is not None:
-                rel_grad *= float(lr_relation[rel_idx])
-
-        adjective_grad = adj_map_one.adjective_embedding.weight.grad
-        if adjective_grad is not None:
-            adjective_lr = torch.tensor(
-                lr_per_adjective, device=adjective_grad.device, dtype=adjective_grad.dtype
-            ).unsqueeze(1)
-            adjective_grad *= adjective_lr
-
-        for rel_idx in range(len(adj_map_one.relations)):
-            rel_grad = adj_map_one.relations[rel_idx].weight.grad
-            if rel_grad is not None:
-                rel_grad *= float(lr_adj_relation[rel_idx])
+        scale_row_gradients(knowledge_map_one.embedding.weight.grad, lr_per_embedding)
+        scale_relation_gradients(knowledge_map_one.relations, lr_relation)
+        scale_row_gradients(adj_map_one.adjective_embedding.weight.grad, lr_per_adjective)
+        scale_relation_gradients(adj_map_one.relations, lr_adj_relation)
 
     optimizer.step()
-
-    for idx in involved_nouns:
-        lr_per_embedding[idx] = max(float(lr_per_embedding[idx]) * lr_decay_embedding, min_lr)
-    for idx in involved_adjectives:
-        lr_per_adjective[idx] = max(float(lr_per_adjective[idx]) * lr_decay_embedding, min_lr)
-    for rt_i in involved_knowledge_relations:
-        rel_idx = rt_i - 1
-        lr_relation[rel_idx] = max(float(lr_relation[rel_idx]) * lr_decay_relation, min_lr)
-    for rt_i in involved_adj_relations:
-        rel_idx = rt_i - 1
-        lr_adj_relation[rel_idx] = max(float(lr_adj_relation[rel_idx]) * lr_decay_relation, min_lr)
+    decay_learning_rates(lr_per_embedding, involved_nouns, lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_per_adjective, involved_adjectives, lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_relation, involved_knowledge_relation_indices, lr_decay_relation, min_lr)
+    decay_learning_rates(lr_adj_relation, involved_adj_relation_indices, lr_decay_relation, min_lr)
 
 
 def save_adj_all(adj_map_one, model_path):

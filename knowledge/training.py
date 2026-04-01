@@ -5,7 +5,7 @@ import torch
 
 rm = importlib.import_module("knowledge.relation_map")
 arm = importlib.import_module("knowledge.adj_relation_map")
-from .adj_map import adj_map, train_joint_average
+from .adj_map import adj_map, train_adj_random, train_joint_average
 from .knowledge_map import knowledge_map, train_average, train_random
 
 knowledge_map_one = knowledge_map(rm.noun_dim, rm.noun_dim)
@@ -30,6 +30,13 @@ def _load_training_state() -> None:
     arm.load_adj_relation_data()
 
 
+def _save_training_state() -> None:
+    rm.save_relation_data()
+    arm.save_adj_relation_data()
+    torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
+    torch.save(adj_map_one.state_dict(), ADJ_MODEL_PATH)
+
+
 def begin_feed_training():
     global _FEED_TRAIN_READY
     _load_training_state()
@@ -40,10 +47,7 @@ def end_feed_training():
     global _FEED_TRAIN_READY
     if not _FEED_TRAIN_READY:
         return
-    rm.save_relation_data()
-    arm.save_adj_relation_data()
-    torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
-    torch.save(adj_map_one.state_dict(), ADJ_MODEL_PATH)
+    _save_training_state()
     _FEED_TRAIN_READY = False
 
 
@@ -74,10 +78,7 @@ def run_joint_training_and_save():
         lr_per_adjective=lr_per_adjective,
         lr_adj_relation=lr_adj_relation,
     )
-    rm.save_relation_data()
-    arm.save_adj_relation_data()
-    torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
-    torch.save(adj_map_one.state_dict(), ADJ_MODEL_PATH)
+    _save_training_state()
 
 
 def run_short_training_and_save(relation_learn, save=True):
@@ -97,6 +98,90 @@ def run_short_training_and_save(relation_learn, save=True):
     if save:
         rm.save_relation_data()
         torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
+
+
+def apply_language_training_samples(samples, save=True):
+    if not _FEED_TRAIN_READY:
+        _load_training_state()
+
+    results = {"noun_noun": [], "adj_noun": []}
+    noun_noun_samples = getattr(samples, "noun_noun_samples", None)
+    if noun_noun_samples is None and isinstance(samples, dict):
+        noun_noun_samples = samples.get("noun_noun_samples", [])
+    adj_noun_samples = getattr(samples, "adj_noun_samples", None)
+    if adj_noun_samples is None and isinstance(samples, dict):
+        adj_noun_samples = samples.get("adj_noun_samples", [])
+
+    for sample in noun_noun_samples or []:
+        created, i_idx, j_idx, relation_type = rm.add_relation_by_type(
+            sample.source_noun,
+            sample.target_noun,
+            sample.relation_type,
+        )
+        loss = train_random(
+            knowledge_map_one,
+            i_idx,
+            j_idx,
+            relation_type,
+            rm.lr_per_embedding,
+            rm.lr_relation,
+        )
+        results["noun_noun"].append(
+            {
+                "created": created,
+                "source_idx": i_idx,
+                "target_idx": j_idx,
+                "relation_type": int(relation_type),
+                "loss": float(loss),
+            }
+        )
+
+    for sample in adj_noun_samples or []:
+        created, noun_idx, adjective_idx, relation_type = arm.add_adj_relation_by_type(
+            sample.noun,
+            sample.adjective,
+            sample.relation_type,
+        )
+        loss = train_adj_random(
+            adj_map_one,
+            noun_idx,
+            adjective_idx,
+            relation_type,
+            rm.lr_per_embedding,
+            arm.lr_per_adjective,
+            arm.lr_adj_relation,
+        )
+        results["adj_noun"].append(
+            {
+                "created": created,
+                "noun_idx": noun_idx,
+                "adjective_idx": adjective_idx,
+                "relation_type": int(relation_type),
+                "loss": float(loss),
+            }
+        )
+
+    if save:
+        _save_training_state()
+    return results
+
+
+def train_sentence_online(
+    sentence,
+    noun_relation_type=None,
+    adjective_relation_types=None,
+    infer_missing=False,
+    save=True,
+):
+    grammar = importlib.import_module("prototype.grammar")
+    samples = grammar.sentence_to_knowledge_samples(
+        sentence,
+        noun_relation_type=noun_relation_type,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+    )
+    results = apply_language_training_samples(samples, save=save)
+    return samples, results
 
 
 def random_feed(noun1, noun2, relation):

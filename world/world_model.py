@@ -2,13 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .action_vocab import (
+    DEFAULT_ACTION_LIST,
+    NO_ACTION_NAME,
+    action_list as shared_action_list,
+    get_full_action_type_list,
+    set_action_list,
+)
+
 attention_dim = 100
 action_dim = 80
-noun_dim = 40
+noun_dim = 50
 value_dim = 100
 hidden_dim = 50
-DEFAULT_ACTION_LIST = ["action1", "action2", "action3"]
-NO_ACTION_NAME = "no_action"
 
 
 class FFN(nn.Module):
@@ -91,7 +97,11 @@ class WorldModel(nn.Module):
         self.attention_dim = attention_dim
         self.value_dim = value_dim
         self.hidden_dim = hidden_dim
-        self.action_list = [NO_ACTION_NAME] + list(action_names or DEFAULT_ACTION_LIST)
+
+        if action_names is not None:
+            set_action_list(action_names)
+
+        self.action_list = get_full_action_type_list()
         self.model_count = len(self.action_list) - 1
         self.action_models = nn.ModuleList(
             [
@@ -355,7 +365,7 @@ class WorldModel(nn.Module):
         }
 
 
-Action_list = [NO_ACTION_NAME] + DEFAULT_ACTION_LIST
+Action_list = get_full_action_type_list()
 
 
 def train_action_model(world_model, input_data, target_action, action_index, optimizer=None, steps=100):

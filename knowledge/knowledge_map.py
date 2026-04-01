@@ -1,22 +1,27 @@
-from .relation_map import noun_number, relation_num, save_relation_data
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._training_utils import (
+    decay_learning_rates,
+    iter_active_relations,
+    relation_type_to_index,
+    scale_relation_gradients,
+    scale_row_gradients,
+)
+from .relation_map import noun_number, relation_num, save_relation_data
+
 
 class knowledge_map(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(knowledge_map, self).__init__()
+        super().__init__()
         self.embedding = nn.Embedding(noun_number, input_dim)
         self.relations = nn.ModuleList(
             [nn.Linear(input_dim, output_dim, bias=False) for _ in range(relation_num)]
         )
 
     def forward(self, input_index, target_index, relation_type):
-        rel_idx = int(relation_type) - 1
-        if rel_idx < 0 or rel_idx >= len(self.relations):
-            raise ValueError(f"relation_type must be in [1, {len(self.relations)}]")
-
+        rel_idx = relation_type_to_index(relation_type, len(self.relations))
         x = self.embedding(input_index)
         target = self.embedding(target_index)
         y = self.relations[rel_idx](x)
@@ -48,9 +53,7 @@ class knowledge_map(nn.Module):
 
 def train_random(knowledge_map_one, i, j, relation_type, lr_per_embedding, lr_relation):
     device = next(knowledge_map_one.parameters()).device
-    rel_idx = int(relation_type) - 1
-    if rel_idx < 0 or rel_idx >= len(knowledge_map_one.relations):
-        raise ValueError(f"relation_type={relation_type} exceeds relation capacity")
+    rel_idx = relation_type_to_index(relation_type, len(knowledge_map_one.relations))
 
     i_idx = int(i)
     j_idx = int(j)
@@ -64,6 +67,7 @@ def train_random(knowledge_map_one, i, j, relation_type, lr_per_embedding, lr_re
     lr_decay_embedding = 0.95
     lr_decay_relation = 0.95
     min_lr = 1e-6
+    loss = None
 
     for _ in range(100):
         knowledge_map_one.zero_grad(set_to_none=True)
@@ -82,15 +86,9 @@ def train_random(knowledge_map_one, i, j, relation_type, lr_per_embedding, lr_re
             if rel_grad is not None:
                 knowledge_map_one.relations[rel_idx].weight -= lr_rel * rel_grad
 
-    lr_per_embedding[i_idx] = max(
-        float(lr_per_embedding[i_idx]) * lr_decay_embedding, min_lr
-    )
-    lr_per_embedding[j_idx] = max(
-        float(lr_per_embedding[j_idx]) * lr_decay_embedding, min_lr
-    )
-    lr_relation[rel_idx] = max(float(lr_relation[rel_idx]) * lr_decay_relation, min_lr)
-
-    return loss.item()
+    decay_learning_rates(lr_per_embedding, [i_idx, j_idx], lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_relation, [rel_idx], lr_decay_relation, min_lr)
+    return float(loss.item()) if loss is not None else 0.0
 
 
 def train_average(
@@ -105,54 +103,26 @@ def train_average(
     optimizer = torch.optim.Adam(knowledge_map_one.parameters(), lr=0.001)
     optimizer.zero_grad()
     involved_nouns = set()
-    involved_relation_types = set()
+    involved_relation_indices = set()
 
-    for i in range(relation_map.shape[0]):
-        for j in range(relation_map.shape[1]):
-            rt = relation_map[i][j]
-            if rt == 0:
-                continue
+    for i, j, relation_type in iter_active_relations(relation_map, len(knowledge_map_one.relations)):
+        involved_nouns.update((i, j))
+        rel_idx = relation_type_to_index(relation_type, len(knowledge_map_one.relations))
+        involved_relation_indices.add(rel_idx)
 
-            rt_i = int(rt)
-            if rt_i < 1 or rt_i > len(knowledge_map_one.relations):
-                continue
-
-            involved_nouns.add(i)
-            involved_nouns.add(j)
-            involved_relation_types.add(rt_i)
-
-            y_pred, y_target = knowledge_map_one(torch.tensor(i), torch.tensor(j), rt_i)
-            loss = F.mse_loss(y_pred, y_target)
-            loss.backward()
+        y_pred, y_target = knowledge_map_one(torch.tensor(i), torch.tensor(j), relation_type)
+        loss = F.mse_loss(y_pred, y_target)
+        loss.backward()
 
     with torch.no_grad():
-        grad = knowledge_map_one.embedding.weight.grad
-        if grad is not None:
-            lr_t = torch.tensor(
-                lr_per_embedding, device=grad.device, dtype=grad.dtype
-            ).unsqueeze(1)
-            grad *= lr_t
-
-        for rel_idx in range(len(knowledge_map_one.relations)):
-            rel_grad = knowledge_map_one.relations[rel_idx].weight.grad
-            if rel_grad is not None:
-                rel_grad *= float(lr_relation[rel_idx])
+        scale_row_gradients(knowledge_map_one.embedding.weight.grad, lr_per_embedding)
+        scale_relation_gradients(knowledge_map_one.relations, lr_relation)
 
     optimizer.step()
-
-    for idx in involved_nouns:
-        lr_per_embedding[idx] = max(
-            float(lr_per_embedding[idx]) * lr_decay_embedding, min_lr
-        )
-    for rt_i in involved_relation_types:
-        rel_idx = rt_i - 1
-        lr_relation[rel_idx] = max(
-            float(lr_relation[rel_idx]) * lr_decay_relation, min_lr
-        )
+    decay_learning_rates(lr_per_embedding, involved_nouns, lr_decay_embedding, min_lr)
+    decay_learning_rates(lr_relation, involved_relation_indices, lr_decay_relation, min_lr)
 
 
 def save_all(knowledge_map_one, model_path):
     save_relation_data()
     torch.save(knowledge_map_one.state_dict(), model_path)
-
-
