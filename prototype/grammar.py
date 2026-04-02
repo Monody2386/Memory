@@ -1,9 +1,16 @@
-"""Grammar utilities for generating noun-action training pairs.
+"""Grammar utilities organized as:
 
-This module provides a small rule-based path from plain sentences to the
-noun-action pairs used by short memory and world-model training.
-It also supports adjective-conditioned noun embeddings via the shared adj_map.
+1. tokenizer
+2. part-of-speech analysis
+3. information extraction by sentence pattern
+
+At the current stage the parser is intentionally rule-based. The grammar core is
+not responsible for learning arbitrary sentence semantics. Instead, each known
+sentence structure gets an explicit extraction strategy so the project can grow
+pattern by pattern over time.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
@@ -14,7 +21,51 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from knowledge.noun_action_map import add_noun_action
 from world.action_vocab import ensure_action
+
+
+@dataclass
+class TaggedToken:
+    text: str
+    pos: str
+    index: int
+    source: str = "lexicon"
+    question_prompt: Optional[str] = None
+    instance_id: Optional[str] = None
+
+
+@dataclass
+class ActionTuple:
+    noun: str
+    action: str
+    role: str
+    position: int
+    noun_instance_id: Optional[str] = None
+    source_tokens: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RelationTuple:
+    source: str
+    relation: str
+    target: str
+    kind: str
+    source_instance_id: Optional[str] = None
+    target_instance_id: Optional[str] = None
+    source_tokens: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ParsedSentence:
+    sentence: str
+    tokens: List[str]
+    tagged_tokens: List[TaggedToken]
+    structure: Tuple[str, ...]
+    pattern_name: str
+    sentence_type: str = "unknown_sentence"
+    action_tuples: List[ActionTuple] = field(default_factory=list)
+    relation_tuples: List[RelationTuple] = field(default_factory=list)
 
 
 @dataclass
@@ -23,6 +74,7 @@ class NounActionPair:
     action: str
     role: str
     position: int
+    noun_instance_id: Optional[str] = None
     noun_index: Optional[int] = None
     noun_embedding: Optional[torch.Tensor] = None
     adjectives: Optional[List[str]] = None
@@ -32,6 +84,7 @@ class NounActionPair:
 class ShortMemoryState:
     noun: str
     action: str
+    noun_instance_id: Optional[str]
     noun_index: Optional[int]
     action_type: int
     noun_embedding: torch.Tensor
@@ -40,6 +93,23 @@ class ShortMemoryState:
     pair_index: int
     role: str
     adjectives: List[str]
+    pair_kind: str = "noun_action"
+
+
+@dataclass
+class ShortMemoryRelationState:
+    source: str
+    relation: str
+    target: str
+    relation_kind: str
+    source_instance_id: Optional[str]
+    target_instance_id: Optional[str]
+    source_index: Optional[int]
+    target_index: Optional[int]
+    source_embedding: Optional[torch.Tensor]
+    target_embedding: Optional[torch.Tensor]
+    time_position: int
+    pair_index: int
 
 
 @dataclass
@@ -94,6 +164,10 @@ WORD_RE = re.compile(r"[A-Za-z']+")
 RelationOverride = Union[int, str]
 
 
+# ---------------------------------------------------------------------------
+# 1. Tokenizer
+# ---------------------------------------------------------------------------
+
 def split_event(event_tokens):
     if len(event_tokens) != 5:
         raise ValueError("event_tokens must contain exactly 5 items")
@@ -104,7 +178,7 @@ def tokenize_sentence(sentence: str) -> List[str]:
     tokens = WORD_RE.findall(sentence)
     if not tokens:
         raise ValueError("sentence does not contain any word tokens")
-    return tokens
+    return [token.lower() for token in tokens]
 
 
 def object_action_form(verb: str) -> str:
@@ -117,6 +191,10 @@ def object_action_form(verb: str) -> str:
         return verb + verb[-1] + "ed"
     return verb + "ed"
 
+
+# ---------------------------------------------------------------------------
+# Shared language context
+# ---------------------------------------------------------------------------
 
 def _load_language_context():
     rm = importlib.import_module("knowledge.relation_map")
@@ -168,16 +246,14 @@ def _resolve_adjective_relation_overrides(
         return [None for _ in adjectives]
 
     if isinstance(overrides, Mapping):
-        resolved = []
-        for adjective in adjectives:
-            resolved.append(
-                _normalize_relation_override(
-                    overrides.get(adjective.lower()),
-                    relation_names,
-                    relation_label="adjective relation",
-                )
+        return [
+            _normalize_relation_override(
+                overrides.get(adjective.lower()),
+                relation_names,
+                relation_label="adjective relation",
             )
-        return resolved
+            for adjective in adjectives
+        ]
 
     if len(overrides) != len(adjectives):
         raise ValueError("adjective_relation_types must match the number of adjectives")
@@ -206,6 +282,310 @@ def infer_adj_relation_type(noun: str, adjective: str) -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 2. Part-of-speech analysis
+# ---------------------------------------------------------------------------
+
+def _build_pos_lexicons():
+    rm, arm, _ = _load_language_context()
+    action_vocab = importlib.import_module("world.action_vocab")
+    relation_tokens = set()
+    for relation in rm.relation_list:
+        relation_tokens.update(relation.lower().split())
+    return {
+        "nouns": {noun.lower() for noun in rm.noun_list},
+        "adjectives": set(arm.adjective_list) | set(ADJECTIVE_RELATION_HINTS.keys()),
+        "actions": {action.lower() for action in action_vocab.action_list},
+        "relations": [relation.lower() for relation in rm.relation_list],
+        "relation_tokens": relation_tokens,
+    }
+
+
+def _resolve_relation_phrase(tokens: Sequence[str], relation_list: Sequence[str]) -> Optional[Tuple[str, int, int]]:
+    candidates: List[Tuple[str, int, int]] = []
+    for start in range(len(tokens)):
+        for end in range(start + 1, len(tokens) + 1):
+            phrase = " ".join(tokens[start:end]).lower()
+            if phrase in relation_list:
+                candidates.append((phrase, start, end))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[2] - item[1], reverse=True)
+    return candidates[0]
+
+
+def tag_tokens(sentence: str) -> List[TaggedToken]:
+    tokens = tokenize_sentence(sentence)
+    lexicons = _build_pos_lexicons()
+    relation_match = _resolve_relation_phrase(tokens, lexicons["relations"])
+    relation_span = set(range(relation_match[1], relation_match[2])) if relation_match else set()
+    question_engine = importlib.import_module("prototype.question").QuestionEngine()
+
+    tagged_tokens: List[TaggedToken] = []
+    for index, token in enumerate(tokens):
+        if index in relation_span:
+            tagged_tokens.append(TaggedToken(text=token, pos="relation", index=index, source="relation_phrase"))
+            continue
+
+        token_info = question_engine.what_is_token(token, position=index, tokens=tokens)
+        pos = token_info.predicted_pos if token_info.predicted_pos != "unknown" else "noun"
+        tagged_tokens.append(
+            TaggedToken(
+                text=token,
+                pos=pos,
+                index=index,
+                source=token_info.source,
+                question_prompt=None if token_info.status == "known" else token_info.prompt,
+            )
+        )
+
+    if len(tagged_tokens) >= 2 and relation_match is None:
+        tagged_tokens[1].pos = "action"
+        if tagged_tokens[1].source == "default_guess":
+            tagged_tokens[1].source = "position_heuristic"
+
+    _assign_noun_instance_ids(tagged_tokens)
+    return tagged_tokens
+
+
+def sentence_structure(sentence: str) -> Tuple[str, ...]:
+    return tuple(token.pos for token in tag_tokens(sentence))
+
+
+def _assign_noun_instance_ids(tagged_tokens: Sequence[TaggedToken]) -> None:
+    noun_occurrence = 0
+    for token in tagged_tokens:
+        if token.pos != "noun":
+            continue
+        noun_occurrence += 1
+        token.instance_id = f"{token.text}#{token.index}:{noun_occurrence}"
+
+
+def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
+    has_action = bool(parsed.action_tuples)
+    has_noun_relation = any(
+        relation_tuple.kind == "noun_noun_relation" for relation_tuple in parsed.relation_tuples
+    )
+    has_adj_relation = any(
+        relation_tuple.kind == "adj_noun_relation" for relation_tuple in parsed.relation_tuples
+    )
+
+    if has_action and has_noun_relation:
+        return "mixed_sentence"
+    if has_action:
+        return "action_sentence"
+    if has_noun_relation:
+        return "relation_sentence"
+    if has_adj_relation:
+        return "attribute_sentence"
+    return "unknown_sentence"
+
+
+def classify_sentence_type(sentence: str) -> str:
+    parsed = parse_sentence(sentence)
+    return parsed.sentence_type
+
+
+# ---------------------------------------------------------------------------
+# 3. Information extraction by sentence pattern
+# ---------------------------------------------------------------------------
+
+def _parse_noun_phrase(tokens: Sequence[str], tags: Sequence[TaggedToken]) -> Tuple[str, List[str], Optional[str]]:
+    if not tokens:
+        raise ValueError("noun phrase cannot be empty")
+    adjectives = [token for token, tag in zip(tokens[:-1], tags[:-1]) if tag.pos == "adj"]
+    noun = tokens[-1]
+    noun_instance_id = tags[-1].instance_id if tags else None
+    return noun, adjectives, noun_instance_id
+
+
+def _extract_pattern_action_with_object(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+) -> ParsedSentence:
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="noun_action_object_phrase",
+        sentence_type="action_sentence",
+    )
+
+    subject = tokens[0]
+    subject_instance_id = tagged_tokens[0].instance_id
+    verb = tokens[1]
+    object_tokens = list(tokens[2:])
+    object_tags = list(tagged_tokens[2:])
+
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=subject,
+            action=verb,
+            role="subject",
+            position=0,
+            noun_instance_id=subject_instance_id,
+            source_tokens=[subject, verb],
+        )
+    )
+
+    if object_tokens:
+        object_noun, adjectives, object_instance_id = _parse_noun_phrase(object_tokens, object_tags)
+        parsed.action_tuples.append(
+            ActionTuple(
+                noun=object_noun,
+                action=object_action_form(verb),
+                role="object",
+                position=1,
+                noun_instance_id=object_instance_id,
+                source_tokens=object_tokens,
+            )
+        )
+
+        _, arm, _ = _load_language_context()
+        relation_types = _resolve_adjective_relation_overrides(
+            adjectives,
+            adjective_relation_types,
+            arm.adj_relation_list,
+        )
+        for adjective, relation_type in zip(adjectives, relation_types):
+            relation_name = None
+            if relation_type is not None:
+                relation_name = arm.adj_relation_list[int(relation_type) - 1]
+            elif infer_missing:
+                inferred_type = infer_adj_relation_type(object_noun, adjective)
+                if inferred_type is not None:
+                    relation_name = arm.adj_relation_list[int(inferred_type) - 1]
+            if relation_name is None:
+                continue
+            parsed.relation_tuples.append(
+                RelationTuple(
+                    source=object_noun,
+                    relation=relation_name,
+                    target=adjective,
+                    kind="adj_noun_relation",
+                    source_instance_id=object_instance_id,
+                    target_instance_id=None,
+                    source_tokens=[adjective, object_noun],
+                )
+            )
+
+    return parsed
+
+
+def _extract_pattern_relation_between_noun_phrases(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+) -> ParsedSentence:
+    rm, arm, _ = _load_language_context()
+    relation_match = _resolve_relation_phrase(tokens, [relation.lower() for relation in rm.relation_list])
+    if relation_match is None:
+        raise ValueError("No noun_noun relation phrase found in relation-pattern sentence")
+
+    relation_name, rel_start, rel_end = relation_match
+    left_tokens = list(tokens[:rel_start])
+    right_tokens = list(tokens[rel_end:])
+    left_tags = list(tagged_tokens[:rel_start])
+    right_tags = list(tagged_tokens[rel_end:])
+    if not left_tokens or not right_tokens:
+        raise ValueError("relation sentence requires noun phrases on both sides")
+
+    left_noun, left_adjectives, left_instance_id = _parse_noun_phrase(left_tokens, left_tags)
+    right_noun, right_adjectives, right_instance_id = _parse_noun_phrase(right_tokens, right_tags)
+
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="noun_phrase_relation_noun_phrase",
+        sentence_type="relation_sentence",
+    )
+    parsed.relation_tuples.append(
+        RelationTuple(
+            source=left_noun,
+            relation=relation_name,
+            target=right_noun,
+            kind="noun_noun_relation",
+            source_instance_id=left_instance_id,
+            target_instance_id=right_instance_id,
+            source_tokens=list(tokens),
+        )
+    )
+
+    all_adj_nouns = [
+        (left_noun, left_adjectives, left_instance_id),
+        (right_noun, right_adjectives, right_instance_id),
+    ]
+    for noun, adjectives, noun_instance_id in all_adj_nouns:
+        relation_types = _resolve_adjective_relation_overrides(
+            adjectives,
+            adjective_relation_types,
+            arm.adj_relation_list,
+        )
+        for adjective, relation_type in zip(adjectives, relation_types):
+            relation_label = None
+            if relation_type is not None:
+                relation_label = arm.adj_relation_list[int(relation_type) - 1]
+            elif infer_missing:
+                inferred_type = infer_adj_relation_type(noun, adjective)
+                if inferred_type is not None:
+                    relation_label = arm.adj_relation_list[int(inferred_type) - 1]
+            if relation_label is None:
+                continue
+            parsed.relation_tuples.append(
+                RelationTuple(
+                    source=noun,
+                    relation=relation_label,
+                    target=adjective,
+                    kind="adj_noun_relation",
+                    source_instance_id=noun_instance_id,
+                    target_instance_id=None,
+                    source_tokens=[adjective, noun],
+                )
+            )
+
+    return parsed
+
+
+def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken]):
+    rm, _, _ = _load_language_context()
+    relation_match = _resolve_relation_phrase(tokens, [relation.lower() for relation in rm.relation_list])
+    if relation_match is not None:
+        return _extract_pattern_relation_between_noun_phrases
+    if len(tokens) >= 2 and tagged_tokens[1].pos == "action":
+        return _extract_pattern_action_with_object
+    raise ValueError(f"No extraction strategy defined for structure {tuple(tag.pos for tag in tagged_tokens)}")
+
+
+def parse_sentence(
+    sentence: str,
+    noun_relation_type: Optional[RelationOverride] = None,
+    adjective_relation_types: Optional[
+        Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
+    ] = None,
+    infer_missing: bool = True,
+) -> ParsedSentence:
+    del noun_relation_type  # grammar parses structure; routing decides how to use relation configs.
+    tokens = tokenize_sentence(sentence)
+    tagged_tokens = tag_tokens(sentence)
+    extractor = _select_extractor(tokens, tagged_tokens)
+    parsed = extractor(
+        tokens,
+        tagged_tokens,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+    )
+    parsed.sentence_type = classify_sentence_type_from_parsed(parsed)
+    return parsed
+
+
 def sentence_to_knowledge_samples(
     sentence: str,
     noun_relation_type: Optional[RelationOverride] = None,
@@ -214,59 +594,53 @@ def sentence_to_knowledge_samples(
     ] = None,
     infer_missing: bool = False,
 ) -> KnowledgeTrainingSamples:
-    tokens = tokenize_sentence(sentence)
-    if len(tokens) < 2:
-        raise ValueError("sentence must contain at least a noun and a verb")
-
+    parsed = parse_sentence(
+        sentence,
+        noun_relation_type=noun_relation_type,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+    )
     rm, arm, _ = _load_language_context()
-    subject = tokens[0].lower()
-    object_tokens = tokens[2:]
     samples = KnowledgeTrainingSamples()
 
-    if object_tokens:
-        object_noun, adjectives = _parse_object_phrase(object_tokens)
-        object_noun = object_noun.lower()
-        subject_idx = rm._ensure_noun(subject)
-        object_idx = rm._ensure_noun(object_noun)
-
-        noun_relation_type_idx = _normalize_relation_override(
-            noun_relation_type,
-            rm.relation_list,
-            relation_label="noun relation",
-        )
-        if noun_relation_type_idx is None and infer_missing:
-            noun_relation_type_idx = 1
-        if noun_relation_type_idx is not None:
-            samples.noun_noun_samples.append(
-                NounNounRelationSample(
-                    source_noun=subject,
-                    target_noun=object_noun,
-                    relation_type=noun_relation_type_idx,
-                    source_idx=subject_idx,
-                    target_idx=object_idx,
-                )
+    for relation_tuple in parsed.relation_tuples:
+        if relation_tuple.kind == "noun_noun_relation":
+            relation_type = _normalize_relation_override(
+                relation_tuple.relation,
+                rm.relation_list,
+                relation_label="noun relation",
             )
-
-        adj_relation_types = _resolve_adjective_relation_overrides(
-            adjectives,
-            adjective_relation_types,
-            arm.adj_relation_list,
-        )
-        for adjective, relation_type in zip(adjectives, adj_relation_types):
-            adjective = adjective.lower()
-            if relation_type is None and infer_missing:
-                relation_type = infer_adj_relation_type(object_noun, adjective)
             if relation_type is None:
                 continue
-            if adjective not in arm.adjective_list:
-                arm.adjective_list.append(adjective)
-            adjective_idx = arm.adjective_list.index(adjective)
+            source_idx = rm._ensure_noun(relation_tuple.source)
+            target_idx = rm._ensure_noun(relation_tuple.target)
+            samples.noun_noun_samples.append(
+                NounNounRelationSample(
+                    source_noun=relation_tuple.source,
+                    target_noun=relation_tuple.target,
+                    relation_type=relation_type,
+                    source_idx=source_idx,
+                    target_idx=target_idx,
+                )
+            )
+        elif relation_tuple.kind == "adj_noun_relation":
+            relation_type = _normalize_relation_override(
+                relation_tuple.relation,
+                arm.adj_relation_list,
+                relation_label="adjective relation",
+            )
+            if relation_type is None:
+                continue
+            noun_idx = rm._ensure_noun(relation_tuple.source)
+            if relation_tuple.target not in arm.adjective_list:
+                arm.adjective_list.append(relation_tuple.target)
+            adjective_idx = arm.adjective_list.index(relation_tuple.target)
             samples.adj_noun_samples.append(
                 AdjNounRelationSample(
-                    noun=object_noun,
-                    adjective=adjective,
-                    relation_type=int(relation_type),
-                    noun_idx=object_idx,
+                    noun=relation_tuple.source,
+                    adjective=relation_tuple.target,
+                    relation_type=relation_type,
+                    noun_idx=noun_idx,
                     adjective_idx=adjective_idx,
                 )
             )
@@ -321,14 +695,6 @@ def inject_adjective_into_noun_embedding(
     return noun_idx, adjusted_noun_embedding.detach()
 
 
-def _parse_object_phrase(tokens: Sequence[str]) -> Tuple[str, List[str]]:
-    if not tokens:
-        return "", []
-    if len(tokens) == 1:
-        return tokens[0], []
-    return tokens[-1], [token.lower() for token in tokens[:-1]]
-
-
 def sentence_to_noun_action_pairs(
     sentence: str,
     adjective_relation_types: Optional[
@@ -336,73 +702,38 @@ def sentence_to_noun_action_pairs(
     ] = None,
     infer_missing: bool = True,
 ) -> List[NounActionPair]:
-    tokens = tokenize_sentence(sentence)
-    if len(tokens) < 2:
-        raise ValueError("sentence must contain at least a noun and a verb")
+    parsed = parse_sentence(
+        sentence,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+    )
+    pairs: List[NounActionPair] = []
+    object_adjectives_map: Dict[str, List[str]] = {}
+    for relation_tuple in parsed.relation_tuples:
+        if relation_tuple.kind == "adj_noun_relation":
+            object_adjectives_map.setdefault(relation_tuple.source, []).append(relation_tuple.target)
 
-    _, arm, _ = _load_language_context()
-    subject = tokens[0]
-    verb = tokens[1]
-    object_tokens = tokens[2:]
+    for action_tuple in parsed.action_tuples:
+        ensure_action(action_tuple.action)
+        noun_idx, noun_embedding = _ensure_noun_embedding(action_tuple.noun)
+        adjectives: List[str] = []
 
-    subject_action = verb.lower()
-    ensure_action(subject_action)
-
-    subject_idx, subject_embedding = _ensure_noun_embedding(subject)
-
-    pairs = [
-        NounActionPair(
-            noun=subject,
-            action=subject_action,
-            role="subject",
-            position=0,
-            noun_index=subject_idx,
-            noun_embedding=subject_embedding,
-            adjectives=[],
-        )
-    ]
-
-    if object_tokens:
-        object_noun, adjectives = _parse_object_phrase(object_tokens)
-        object_action = object_action_form(verb)
-        ensure_action(object_action)
-        relation_types = _resolve_adjective_relation_overrides(
-            adjectives,
-            adjective_relation_types,
-            arm.adj_relation_list,
-        )
-
-        if adjectives:
-            current_embedding = None
-            object_idx = None
-            for adjective, relation_type in zip(adjectives, relation_types):
-                if relation_type is None and infer_missing:
-                    relation_type = infer_adj_relation_type(object_noun, adjective)
-                if relation_type is None:
-                    continue
-                object_idx, current_embedding = inject_adjective_into_noun_embedding(
-                    noun=object_noun,
-                    adjective=adjective,
-                    relation_type=relation_type,
-                )
-            if current_embedding is None:
-                object_idx, object_embedding = _ensure_noun_embedding(object_noun)
-            else:
-                object_embedding = current_embedding
-        else:
-            object_idx, object_embedding = _ensure_noun_embedding(object_noun)
+        if action_tuple.role == "object":
+            adjectives = object_adjectives_map.get(action_tuple.noun, [])
 
         pairs.append(
             NounActionPair(
-                noun=object_noun,
-                action=object_action,
-                role="object",
-                position=1,
-                noun_index=object_idx,
-                noun_embedding=object_embedding,
+                noun=action_tuple.noun,
+                action=action_tuple.action,
+                role=action_tuple.role,
+                position=action_tuple.position,
+                noun_instance_id=action_tuple.noun_instance_id,
+                noun_index=noun_idx,
+                noun_embedding=noun_embedding,
                 adjectives=adjectives,
             )
         )
+        add_noun_action(action_tuple.noun, action_tuple.action)
 
     return pairs
 
@@ -452,6 +783,7 @@ def noun_action_pairs_to_short_memory_states(
             ShortMemoryState(
                 noun=pair.noun,
                 action=pair.action,
+                noun_instance_id=pair.noun_instance_id,
                 noun_index=pair.noun_index,
                 action_type=action_type,
                 noun_embedding=noun_embedding,
@@ -464,6 +796,62 @@ def noun_action_pairs_to_short_memory_states(
         )
 
     return states
+
+
+def parsed_sentence_to_relation_memory_states(
+    parsed: ParsedSentence,
+    time_position: int = 0,
+) -> List[ShortMemoryRelationState]:
+    relation_states: List[ShortMemoryRelationState] = []
+    for pair_index, relation_tuple in enumerate(parsed.relation_tuples):
+        source_index = None
+        target_index = None
+        source_embedding = None
+        target_embedding = None
+
+        if relation_tuple.source_instance_id is not None:
+            source_index, source_embedding = _ensure_noun_embedding(relation_tuple.source)
+
+        if relation_tuple.target_instance_id is not None:
+            target_index, target_embedding = _ensure_noun_embedding(relation_tuple.target)
+
+        relation_states.append(
+            ShortMemoryRelationState(
+                source=relation_tuple.source,
+                relation=relation_tuple.relation,
+                target=relation_tuple.target,
+                relation_kind=relation_tuple.kind,
+                source_instance_id=relation_tuple.source_instance_id,
+                target_instance_id=relation_tuple.target_instance_id,
+                source_index=source_index,
+                target_index=target_index,
+                source_embedding=source_embedding,
+                target_embedding=target_embedding,
+                time_position=int(time_position),
+                pair_index=pair_index,
+            )
+        )
+
+    return relation_states
+
+
+def sentence_to_relation_memory_states(
+    sentence: str,
+    time_position: int = 0,
+    adjective_relation_types: Optional[
+        Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
+    ] = None,
+    infer_missing: bool = True,
+) -> List[ShortMemoryRelationState]:
+    parsed = parse_sentence(
+        sentence,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+    )
+    return parsed_sentence_to_relation_memory_states(
+        parsed=parsed,
+        time_position=time_position,
+    )
 
 
 def sentence_to_short_memory_states(
@@ -498,16 +886,80 @@ def append_sentence_to_short_memory(
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
 ):
-    states = sentence_to_short_memory_states(
-        sentence=sentence,
-        world_model=world_model,
-        action_type_map=action_type_map,
-        time_position=time_position,
+    parsed = parse_sentence(
+        sentence,
         adjective_relation_types=adjective_relation_types,
     )
+    action_type_map = action_type_map or build_action_type_map(world_model)
 
-    for state in states:
-        short_memory.append_state(
+    relation_states = parsed_sentence_to_relation_memory_states(
+        parsed=parsed,
+        time_position=time_position,
+    )
+
+    for relation_state in relation_states:
+        short_memory.append_relation(
+            relation_name=relation_state.relation,
+            source_text=relation_state.source,
+            target_text=relation_state.target,
+            relation_kind=relation_state.relation_kind,
+            score=base_score,
+            time_position=relation_state.time_position,
+            pair_index=relation_state.pair_index,
+            source_instance_id=relation_state.source_instance_id,
+            target_instance_id=relation_state.target_instance_id,
+            source_type=relation_state.source_index,
+            target_type=relation_state.target_index,
+            source_embedding=None,
+            target_embedding=None,
+            info_pair={
+                "pair_kind": relation_state.relation_kind,
+                "relation_name": relation_state.relation,
+                "source": relation_state.source,
+                "target": relation_state.target,
+                "source_instance_id": relation_state.source_instance_id,
+                "target_instance_id": relation_state.target_instance_id,
+                "time_position": relation_state.time_position,
+                "pair_index": relation_state.pair_index,
+            },
+        )
+
+    object_adjectives_map: Dict[str, List[str]] = {}
+    for relation_tuple in parsed.relation_tuples:
+        if relation_tuple.kind == "adj_noun_relation":
+            object_adjectives_map.setdefault(relation_tuple.source, []).append(relation_tuple.target)
+
+    states: List[ShortMemoryState] = []
+    for pair_index, action_tuple in enumerate(parsed.action_tuples):
+        ensure_action(action_tuple.action)
+        noun_idx, noun_embedding, noun_instance_id = short_memory.ensure_noun_instance(
+            action_tuple.noun,
+            action_tuple.noun_instance_id,
+        )
+        action_key = action_tuple.action.lower()
+        if action_key not in action_type_map:
+            raise ValueError(f"Action '{action_tuple.action}' not found in action_type_map")
+        action_type = int(action_type_map[action_key])
+        action_embedding = world_model.get_action_embedding(action_type).detach().clone()
+        adjectives = object_adjectives_map.get(action_tuple.noun, []) if action_tuple.role == "object" else []
+
+        state = ShortMemoryState(
+            noun=action_tuple.noun,
+            action=action_tuple.action,
+            noun_instance_id=noun_instance_id,
+            noun_index=noun_idx,
+            action_type=action_type,
+            noun_embedding=noun_embedding.view(-1).clone(),
+            action_embedding=action_embedding,
+            time_position=int(time_position),
+            pair_index=pair_index,
+            role=action_tuple.role,
+            adjectives=list(adjectives),
+        )
+        states.append(state)
+        add_noun_action(action_tuple.noun, action_tuple.action)
+
+        short_memory.append_event(
             noun_embedding=state.noun_embedding,
             action_embedding=state.action_embedding,
             score=base_score,
@@ -515,6 +967,22 @@ def append_sentence_to_short_memory(
             action_type=state.action_type,
             time_position=state.time_position,
             pair_index=state.pair_index,
+            instance_id=state.noun_instance_id,
+            noun_text=state.noun,
+            action_text=state.action,
+            role=state.role,
+            adjectives=list(state.adjectives),
+            pair_kind=state.pair_kind,
+            info_pair={
+                "pair_kind": state.pair_kind,
+                "noun": state.noun,
+                "noun_instance_id": state.noun_instance_id,
+                "action": state.action,
+                "role": state.role,
+                "adjectives": list(state.adjectives),
+                "time_position": state.time_position,
+                "pair_index": state.pair_index,
+            },
         )
 
     return states

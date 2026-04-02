@@ -9,7 +9,7 @@ import random
 from typing import Optional
 
 from knowledge.relation_map import relation_map
-from .question import AnswerResult, ProposedQuestion, QuestionEngine
+from .question import AnswerResult, ProposedQuestion, QuestionEngine, TokenWhatResult
 
 
 @dataclass
@@ -33,6 +33,7 @@ class Consciousness:
             "thinking": "predict relation targets, evaluate confidence, and surface one question to ask",
             "learning": "directly train noun_noun or adj_noun relations",
             "question": "handle yes/no correction for a proposed question",
+            "what": "inspect whether a token is already known and ask what part-of-speech it should be",
         }
 
     def _prediction_status(self, confidence: float) -> str:
@@ -206,6 +207,15 @@ class Consciousness:
     def think(self, rng: Optional[random.Random] = None) -> Optional[ProposedQuestion]:
         return self.question.sample_question(rng or random.Random())
 
+    def what(
+        self,
+        token: str,
+        *,
+        position: Optional[int] = None,
+        tokens: Optional[list[str]] = None,
+    ) -> TokenWhatResult:
+        return self.question.what_is_token(token, position=position, tokens=tokens)
+
     def learn_noun_relation(self, source_noun: str, target_noun: str, relation_type: int, save: bool = True):
         return self.question.direct_learn_noun_relation(
             source_noun,
@@ -254,7 +264,7 @@ class Consciousness:
 
 def available_reasoning_modes():
     return {
-        "what": "similarity search over concept embeddings",
+        "what": "inspect whether a token is known and ask for its part-of-speech when needed",
         "where": "type or relation lookup",
         "when": "type or relation lookup",
         "recall": "retrieve stored noun_noun and adj_noun relations from memory maps",

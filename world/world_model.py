@@ -2,54 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .action_vocab import (
-    DEFAULT_ACTION_LIST,
-    NO_ACTION_NAME,
-    action_list as shared_action_list,
-    get_full_action_type_list,
-    set_action_list,
-)
+from .action_vocab import get_full_action_type_list, set_action_list
 
 attention_dim = 100
 action_dim = 80
 noun_dim = 50
 value_dim = 100
 hidden_dim = 50
-
-
-class FFN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(FFN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
-class Event_Attention(nn.Module):
-    def __init__(self, noun_dim, action_dim, attention_dim, value_dim):
-        super(Event_Attention, self).__init__()
-        self.Wq = nn.Linear(noun_dim + action_dim, attention_dim)
-        self.Wk = nn.Linear(noun_dim + action_dim, attention_dim)
-        self.Wv = nn.Linear(noun_dim + action_dim, value_dim)
-        self.scale = attention_dim ** 0.5
-
-    def forward(self, input_tensor):
-        input_prefix = input_tensor[:, :-1, :]
-        input_suffix = input_tensor[:, -1, :]
-
-        q = self.Wq(input_suffix)
-        k = self.Wk(input_prefix)
-        v = self.Wv(input_prefix)
-
-        scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) / self.scale
-        attention_weight = F.softmax(scores, dim=-1)
-        output = torch.matmul(attention_weight, v).squeeze(1)
-        output = output + self.Wv(input_suffix)
-        return output
 
 
 class ActionModel(nn.Module):
@@ -212,9 +171,27 @@ class WorldModel(nn.Module):
         memory_input = short_memory.build_world_model_input(steps=steps)
         if memory_input.numel() == 0:
             raise ValueError("short_memory is empty")
+        focus_entry = short_memory.get_focus_entry(steps=steps)
         pred_action = self.forward(memory_input, action_type)
         pred_action_type = self.nearest_action_type(pred_action)
-        return pred_action, pred_action_type
+        focus_noun_embedding = None
+        focus_noun_instance_id = None
+        focus_action_instance_id = None
+        if focus_entry is not None:
+            focus_noun_embedding = short_memory.get_noun_embedding(focus_entry.noun_instance_id)
+            focus_noun_instance_id = focus_entry.noun_instance_id
+            focus_action_instance_id = focus_entry.action_instance_id
+        return {
+            "pred_action": pred_action,
+            "pred_action_type": pred_action_type,
+            "focus_noun_embedding": focus_noun_embedding,
+            "focus_noun_type": None if focus_entry is None else focus_entry.noun_type,
+            "focus_action_type": None if focus_entry is None else focus_entry.action_type,
+            "focus_time_position": None if focus_entry is None else focus_entry.time_position,
+            "focus_pair_index": None if focus_entry is None else focus_entry.pair_index,
+            "focus_noun_instance_id": focus_noun_instance_id,
+            "focus_action_instance_id": focus_action_instance_id,
+        }
 
     def training_step_from_short_memory(
         self,
@@ -226,9 +203,11 @@ class WorldModel(nn.Module):
         steps=None,
     ):
         optimizer = optimizer or self.build_optimizer()
-        pred_action, pred_action_type = self.predict_from_short_memory(
+        prediction = self.predict_from_short_memory(
             short_memory, action_type, steps=steps
         )
+        pred_action = prediction["pred_action"]
+        pred_action_type = prediction["pred_action_type"]
 
         if target_action_embedding is None:
             if target_action_type is None:
@@ -253,21 +232,47 @@ class WorldModel(nn.Module):
             "loss": float(loss.item()),
             "pred_action": pred_action.detach(),
             "pred_action_type": int(pred_action_type),
+            "focus_noun_embedding": prediction["focus_noun_embedding"],
+            "focus_noun_type": prediction["focus_noun_type"],
+            "focus_action_type": prediction["focus_action_type"],
+            "focus_time_position": prediction["focus_time_position"],
+            "focus_pair_index": prediction["focus_pair_index"],
+            "focus_noun_instance_id": prediction["focus_noun_instance_id"],
+            "focus_action_instance_id": prediction["focus_action_instance_id"],
         }
 
     def autoregressive_step(
         self,
         short_memory,
-        noun_embedding: torch.Tensor,
-        action_type: int,
+        noun_embedding: torch.Tensor = None,
+        action_type: int = None,
         score=0.0,
         noun_type=None,
+        noun_instance_id=None,
         time_position: int = 0,
         steps=None,
     ):
-        pred_action, pred_action_type = self.predict_from_short_memory(
+        if action_type is None:
+            raise ValueError("action_type must be provided")
+
+        prediction = self.predict_from_short_memory(
             short_memory, action_type, steps=steps
         )
+        pred_action = prediction["pred_action"]
+        pred_action_type = prediction["pred_action_type"]
+        focus_noun_embedding = prediction["focus_noun_embedding"]
+
+        if noun_embedding is None:
+            if focus_noun_embedding is None:
+                raise ValueError("noun_embedding must be provided when short_memory has no focus noun")
+            noun_embedding = focus_noun_embedding
+        if noun_type is None:
+            noun_type = prediction["focus_noun_type"]
+        if noun_instance_id is None:
+            noun_instance_id = prediction["focus_noun_instance_id"]
+        if time_position == 0 and prediction["focus_time_position"] is not None:
+            time_position = int(prediction["focus_time_position"]) + 1
+
         next_action_embedding = self.get_action_embedding(pred_action_type).detach()
         short_memory.append_state(
             noun_embedding=noun_embedding,
@@ -275,12 +280,23 @@ class WorldModel(nn.Module):
             score=score,
             noun_type=noun_type,
             action_type=pred_action_type,
+            noun_instance_id=noun_instance_id,
             time_position=time_position,
         )
         return {
             "pred_action": pred_action.detach(),
             "pred_action_type": int(pred_action_type),
             "stored_action_embedding": next_action_embedding.detach(),
+            "focus_noun_embedding": None if focus_noun_embedding is None else focus_noun_embedding.detach().clone(),
+            "focus_noun_type": prediction["focus_noun_type"],
+            "focus_action_type": prediction["focus_action_type"],
+            "focus_time_position": prediction["focus_time_position"],
+            "focus_pair_index": prediction["focus_pair_index"],
+            "focus_noun_instance_id": prediction["focus_noun_instance_id"],
+            "focus_action_instance_id": prediction["focus_action_instance_id"],
+            "used_noun_embedding": noun_embedding.detach().clone(),
+            "used_noun_type": noun_type,
+            "used_noun_instance_id": noun_instance_id,
         }
 
     def autoregressive_rollout(

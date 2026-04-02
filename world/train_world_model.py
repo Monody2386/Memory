@@ -4,7 +4,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 
-from .shortmemory import ScoredTensorQueue, short_memory
+from .shortmemory import ScoredTensorQueue
 
 
 def _wm():
@@ -65,11 +65,12 @@ def _eval_single_sample(world_model, sample, device: str) -> float:
     if _is_memory_sample(sample):
         memory, action_type, target_action_embedding = sample[:3]
         steps = sample[3] if len(sample) > 3 else None
-        pred_action, _ = world_model.predict_from_short_memory(
+        prediction = world_model.predict_from_short_memory(
             short_memory=memory,
             action_type=action_type,
             steps=steps,
         )
+        pred_action = prediction["pred_action"]
         target_action_embedding = target_action_embedding.to(device)
         loss = torch.nn.functional.mse_loss(pred_action, target_action_embedding)
         return float(loss.item())

@@ -82,9 +82,11 @@ def build_demo_memory(world_model: WorldModel, sentence_specs) -> ShortMemory:
 
 def evaluate_prediction(world_model: WorldModel, memory: ShortMemory, action_type: int, target_action_type: int):
     with torch.no_grad():
-        pred_action, pred_action_type = world_model.predict_from_short_memory(
+        prediction = world_model.predict_from_short_memory(
             memory, action_type=action_type
         )
+        pred_action = prediction["pred_action"]
+        pred_action_type = prediction["pred_action_type"]
         target_embedding = world_model.get_action_embedding(target_action_type).detach()
         loss = torch.nn.functional.mse_loss(pred_action, target_embedding).item()
         top_indices, top_scores = world_model.infer_action_type(

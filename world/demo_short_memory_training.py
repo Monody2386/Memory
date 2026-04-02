@@ -41,7 +41,9 @@ def build_demo_memory(model: WorldModel) -> ScoredTensorQueue:
 
 def evaluate_model(model: WorldModel, memory: ScoredTensorQueue, action_type: int, target_type: int):
     with torch.no_grad():
-        pred_action, pred_type = model.predict_from_short_memory(memory, action_type=action_type)
+        prediction = model.predict_from_short_memory(memory, action_type=action_type)
+        pred_action = prediction["pred_action"]
+        pred_type = prediction["pred_action_type"]
         target_embedding = model.get_action_embedding(target_type).detach().clone()
         loss = torch.nn.functional.mse_loss(pred_action, target_embedding).item()
         top_indices, top_scores = model.infer_action_type(pred_action, top_k=model.model_count)
@@ -169,4 +171,3 @@ def run_demo(
 
 if __name__ == "__main__":
     run_demo()
-

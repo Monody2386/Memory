@@ -4,13 +4,14 @@ from dataclasses import dataclass
 import importlib
 import os
 import random
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
 QuestionKind = Literal["adj_noun", "noun_noun"]
 NounQuestionTarget = Literal["noun", "relation"]
+TokenPos = Literal["noun", "adj", "action", "relation", "unknown"]
 
 
 @dataclass
@@ -40,6 +41,16 @@ class AnswerResult:
     source_noun: str
     target_value: Optional[str] = None
     loss: Optional[float] = None
+
+
+@dataclass
+class TokenWhatResult:
+    token: str
+    predicted_pos: TokenPos
+    status: str
+    prompt: str
+    candidates: List[str]
+    source: str
 
 
 class QuestionEngine:
@@ -113,6 +124,140 @@ class QuestionEngine:
             ):
                 return arm.bind_adjective_to_index(adjective, predicted_idx)
         return arm._ensure_adjective(adjective)
+
+    def _token_lexicons(self):
+        rm, arm, _ = self._ctx()
+        action_vocab = importlib.import_module("world.action_vocab")
+        relation_tokens = set()
+        for relation in rm.relation_list:
+            relation_tokens.update(relation.lower().split())
+        adjective_hints = set(importlib.import_module("prototype.grammar").ADJECTIVE_RELATION_HINTS.keys())
+        return {
+            "nouns": {noun.lower() for noun in rm.noun_list},
+            "adjectives": set(arm.adjective_list) | adjective_hints,
+            "actions": {action.lower() for action in action_vocab.action_list},
+            "relations": {relation.lower() for relation in rm.relation_list},
+            "relation_tokens": relation_tokens,
+            "rm": rm,
+            "arm": arm,
+        }
+
+    def what_is_token(
+        self,
+        token: str,
+        *,
+        position: Optional[int] = None,
+        tokens: Optional[Sequence[str]] = None,
+    ) -> TokenWhatResult:
+        token = token.lower()
+        lexicons = self._token_lexicons()
+
+        if token in lexicons["nouns"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="noun",
+                status="known",
+                prompt=f"'{token}' is already known as a noun.",
+                candidates=["noun"],
+                source="noun_list",
+            )
+        if token in lexicons["adjectives"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="adj",
+                status="known",
+                prompt=f"'{token}' is already known as an adjective.",
+                candidates=["adj"],
+                source="adjective_list",
+            )
+        if token in lexicons["actions"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="action",
+                status="known",
+                prompt=f"'{token}' is already known as an action.",
+                candidates=["action"],
+                source="action_list",
+            )
+        if token in lexicons["relations"] or token in lexicons["relation_tokens"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="relation",
+                status="known",
+                prompt=f"'{token}' is already known as a relation token.",
+                candidates=["relation"],
+                source="relation_list",
+            )
+
+        guessed_pos: TokenPos = "noun"
+        source = "default_guess"
+        if position == 1:
+            guessed_pos = "action"
+            source = "position_heuristic"
+        if tokens is not None:
+            lowered_tokens = [item.lower() for item in tokens]
+            joined = " ".join(lowered_tokens)
+            for relation in lexicons["relations"]:
+                if relation in joined and token in relation.split():
+                    guessed_pos = "relation"
+                    source = "relation_phrase_heuristic"
+                    break
+
+        prompt = (
+            f"I do not know the token '{token}'. What is it in this sentence: "
+            f"noun, adj, action, or relation? Current best guess: {guessed_pos}."
+        )
+        return TokenWhatResult(
+            token=token,
+            predicted_pos=guessed_pos,
+            status="question",
+            prompt=prompt,
+            candidates=["noun", "adj", "action", "relation"],
+            source=source,
+        )
+
+    def register_token_pos(self, token: str, pos: TokenPos, save: bool = True) -> dict:
+        token = token.lower()
+        if pos == "unknown":
+            raise ValueError("Cannot register token with pos='unknown'")
+
+        rm, arm, kt = self._ctx()
+        created = False
+        if pos == "noun":
+            if token not in rm.noun_list:
+                rm._ensure_noun(token)
+                created = True
+        elif pos == "adj":
+            if token not in arm.adjective_list:
+                arm._ensure_adjective(token)
+                created = True
+        elif pos == "action":
+            action_vocab = importlib.import_module("world.action_vocab")
+            if token not in action_vocab.action_list:
+                action_vocab.ensure_action(token)
+                created = True
+        elif pos == "relation":
+            if token not in rm.relation_list:
+                if len(rm.relation_list) >= rm.relation_num:
+                    raise ValueError(
+                        f"relation_list is full; cannot register new relation '{token}'"
+                    )
+                rm.relation_list.append(token)
+                created = True
+        else:
+            raise ValueError("pos must be one of: noun, adj, action, relation")
+
+        if save:
+            rm.save_relation_data()
+            arm.save_adj_relation_data()
+            torch.save(kt.knowledge_map_one.state_dict(), kt.MODEL_PATH)
+            torch.save(kt.adj_map_one.state_dict(), kt.ADJ_MODEL_PATH)
+
+        return {
+            "token": token,
+            "pos": pos,
+            "created": created,
+        }
 
     def predict_adjective(self, noun: str, relation_type: int, top_k: int = 3) -> ProposedQuestion:
         rm, arm, kt = self._ctx()
@@ -512,4 +657,5 @@ __all__ = [
     "AnswerResult",
     "ProposedQuestion",
     "QuestionEngine",
+    "TokenWhatResult",
 ]
