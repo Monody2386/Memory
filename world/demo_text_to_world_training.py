@@ -82,9 +82,7 @@ def build_demo_memory(world_model: WorldModel, sentence_specs) -> ShortMemory:
 
 def evaluate_prediction(world_model: WorldModel, memory: ShortMemory, action_type: int, target_action_type: int):
     with torch.no_grad():
-        prediction = world_model.predict_from_short_memory(
-            memory, action_type=action_type
-        )
+        prediction = world_model.predict_next_event(memory, action_type=action_type, score=0.5)
         pred_action = prediction["pred_action"]
         pred_action_type = prediction["pred_action_type"]
         target_embedding = world_model.get_action_embedding(target_action_type).detach()
@@ -92,12 +90,19 @@ def evaluate_prediction(world_model: WorldModel, memory: ShortMemory, action_typ
         top_indices, top_scores = world_model.infer_action_type(
             pred_action, top_k=world_model.model_count
         )
+        predicted_event = prediction["predicted_event_dict"]
 
     return {
         "loss": loss,
         "pred_action_type": int(pred_action_type),
         "top_indices": top_indices.tolist(),
         "top_scores": [round(float(score.item()), 4) for score in top_scores],
+        "predicted_event": {
+            "noun_instance_id": predicted_event["noun_instance_id"],
+            "action_type": predicted_event["action_type"],
+            "time_position": predicted_event["time_position"],
+            "score": round(float(predicted_event["score"]), 3),
+        },
     }
 
 
@@ -141,7 +146,7 @@ def run_demo(num_epochs: int = 100, print_every: int = 20):
     print(before)
 
     for epoch in range(1, num_epochs + 1):
-        result = world_model.training_step_from_short_memory(
+        result = world_model.training_step_next_event(
             short_memory=memory,
             action_type=input_action_type,
             target_action_type=target_action_type,
@@ -168,20 +173,20 @@ def run_demo(num_epochs: int = 100, print_every: int = 20):
     print(after)
 
     rollout_noun = torch.linspace(-0.5, 0.5, noun_dim)
-    rollout = world_model.autoregressive_step(
-        short_memory=memory,
-        noun_embedding=rollout_noun,
-        action_type=input_action_type,
-        noun_type=42,
-        time_position=2,
-        score=1.0,
-    )
-    print("Autoregressive step")
+    prediction = world_model.predict_next_event(memory, action_type=input_action_type, score=0.5)
+    predicted_event = prediction["predicted_event"]
+    predicted_event.noun_embedding = rollout_noun.detach().clone()
+    predicted_event.noun_type = 42
+    predicted_event.time_position = 2
+    stored_event = world_model.append_predicted_event(memory, predicted_event)
+    print("Predicted event append")
     print(
         {
-            "pred_action_type": rollout["pred_action_type"],
+            "pred_action_type": prediction["pred_action_type"],
             "memory_size": len(memory),
             "latest_time": memory.entries[-1].time_position,
+            "noun_instance_id": stored_event.noun_instance_id,
+            "action_instance_id": stored_event.action_instance_id,
         }
     )
 

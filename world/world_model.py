@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +12,36 @@ action_dim = 80
 noun_dim = 50
 value_dim = 100
 hidden_dim = 50
+
+
+@dataclass
+class PredictedEvent:
+    noun_instance_id: Optional[str]
+    noun_type: Optional[int]
+    noun_embedding: Optional[torch.Tensor]
+    action_instance_id: Optional[str]
+    action_type: int
+    action_embedding: torch.Tensor
+    source_action_type: Optional[int]
+    source_time_position: Optional[int]
+    source_pair_index: Optional[int]
+    time_position: int
+    score: float
+
+    def as_dict(self):
+        return {
+            "noun_instance_id": self.noun_instance_id,
+            "noun_type": self.noun_type,
+            "noun_embedding": self.noun_embedding,
+            "action_instance_id": self.action_instance_id,
+            "action_type": self.action_type,
+            "action_embedding": self.action_embedding,
+            "source_action_type": self.source_action_type,
+            "source_time_position": self.source_time_position,
+            "source_pair_index": self.source_pair_index,
+            "time_position": self.time_position,
+            "score": self.score,
+        }
 
 
 class ActionModel(nn.Module):
@@ -193,7 +226,89 @@ class WorldModel(nn.Module):
             "focus_action_instance_id": focus_action_instance_id,
         }
 
-    def training_step_from_short_memory(
+    def predict_next_event(self, short_memory, action_type: int, steps=None, score: float = 0.5):
+        prediction = self.predict_from_short_memory(short_memory, action_type=action_type, steps=steps)
+        pred_action_type = int(prediction["pred_action_type"])
+        pred_action_embedding = self.get_action_embedding(pred_action_type).detach().clone()
+        next_time_position = 0
+        if prediction["focus_time_position"] is not None:
+            next_time_position = int(prediction["focus_time_position"]) + 1
+
+        predicted_event = PredictedEvent(
+            noun_instance_id=prediction["focus_noun_instance_id"],
+            noun_type=prediction["focus_noun_type"],
+            noun_embedding=None if prediction["focus_noun_embedding"] is None else prediction["focus_noun_embedding"].detach().clone(),
+            action_instance_id=None,
+            action_type=pred_action_type,
+            action_embedding=pred_action_embedding,
+            source_action_type=prediction["focus_action_type"],
+            source_time_position=prediction["focus_time_position"],
+            source_pair_index=prediction["focus_pair_index"],
+            time_position=next_time_position,
+            score=float(score),
+        )
+        result = prediction.copy()
+        result["predicted_event"] = predicted_event
+        result["predicted_event_dict"] = predicted_event.as_dict()
+        return result
+
+    def append_predicted_event(
+        self,
+        short_memory,
+        predicted_event,
+        *,
+        pair_index=None,
+        noun_text=None,
+        action_text=None,
+        role="predicted",
+        pair_kind="noun_action",
+    ):
+        if isinstance(predicted_event, PredictedEvent):
+            event = predicted_event
+        else:
+            event = PredictedEvent(**predicted_event)
+
+        if event.noun_embedding is None:
+            raise ValueError("predicted_event requires noun_embedding to be written back")
+
+        resolved_pair_index = pair_index if pair_index is not None else len(short_memory.entries)
+        if event.action_instance_id is None:
+            event.action_instance_id = short_memory._default_action_instance_id(
+                event.action_type,
+                time_position=event.time_position,
+                pair_index=resolved_pair_index,
+            )
+
+        short_memory.append_event(
+            noun_embedding=event.noun_embedding,
+            action_embedding=event.action_embedding,
+            score=event.score,
+            noun_type=event.noun_type,
+            action_type=event.action_type,
+            noun_instance_id=event.noun_instance_id,
+            action_instance_id=event.action_instance_id,
+            time_position=event.time_position,
+            pair_index=pair_index,
+            noun_text=noun_text,
+            action_text=action_text,
+            role=role,
+            pair_kind=pair_kind,
+            info_pair={
+                "pair_kind": pair_kind,
+                "noun_instance_id": event.noun_instance_id,
+                "action_instance_id": event.action_instance_id,
+                "noun_type": event.noun_type,
+                "action_type": event.action_type,
+                "time_position": event.time_position,
+                "source_action_type": event.source_action_type,
+                "source_time_position": event.source_time_position,
+                "source_pair_index": event.source_pair_index,
+                "role": role,
+            },
+        )
+        return event
+
+    def training_step_next_event(
         self,
         short_memory,
         action_type: int,
@@ -241,6 +356,24 @@ class WorldModel(nn.Module):
             "focus_action_instance_id": prediction["focus_action_instance_id"],
         }
 
+    def training_step_from_short_memory(
+        self,
+        short_memory,
+        action_type: int,
+        target_action_embedding=None,
+        target_action_type=None,
+        optimizer=None,
+        steps=None,
+    ):
+        return self.training_step_next_event(
+            short_memory=short_memory,
+            action_type=action_type,
+            target_action_embedding=target_action_embedding,
+            target_action_type=target_action_type,
+            optimizer=optimizer,
+            steps=steps,
+        )
+
     def autoregressive_step(
         self,
         short_memory,
@@ -255,38 +388,26 @@ class WorldModel(nn.Module):
         if action_type is None:
             raise ValueError("action_type must be provided")
 
-        prediction = self.predict_from_short_memory(
-            short_memory, action_type, steps=steps
-        )
+        prediction = self.predict_next_event(short_memory, action_type, steps=steps, score=score)
         pred_action = prediction["pred_action"]
         pred_action_type = prediction["pred_action_type"]
         focus_noun_embedding = prediction["focus_noun_embedding"]
+        predicted_event = prediction["predicted_event"]
 
-        if noun_embedding is None:
-            if focus_noun_embedding is None:
-                raise ValueError("noun_embedding must be provided when short_memory has no focus noun")
-            noun_embedding = focus_noun_embedding
-        if noun_type is None:
-            noun_type = prediction["focus_noun_type"]
-        if noun_instance_id is None:
-            noun_instance_id = prediction["focus_noun_instance_id"]
-        if time_position == 0 and prediction["focus_time_position"] is not None:
-            time_position = int(prediction["focus_time_position"]) + 1
+        if noun_embedding is not None:
+            predicted_event.noun_embedding = noun_embedding.detach().clone()
+        if noun_type is not None:
+            predicted_event.noun_type = noun_type
+        if noun_instance_id is not None:
+            predicted_event.noun_instance_id = noun_instance_id
+        if time_position != 0:
+            predicted_event.time_position = int(time_position)
 
-        next_action_embedding = self.get_action_embedding(pred_action_type).detach()
-        short_memory.append_state(
-            noun_embedding=noun_embedding,
-            action_embedding=next_action_embedding,
-            score=score,
-            noun_type=noun_type,
-            action_type=pred_action_type,
-            noun_instance_id=noun_instance_id,
-            time_position=time_position,
-        )
+        stored_event = self.append_predicted_event(short_memory, predicted_event)
         return {
             "pred_action": pred_action.detach(),
             "pred_action_type": int(pred_action_type),
-            "stored_action_embedding": next_action_embedding.detach(),
+            "stored_action_embedding": stored_event.action_embedding.detach(),
             "focus_noun_embedding": None if focus_noun_embedding is None else focus_noun_embedding.detach().clone(),
             "focus_noun_type": prediction["focus_noun_type"],
             "focus_action_type": prediction["focus_action_type"],
@@ -294,9 +415,11 @@ class WorldModel(nn.Module):
             "focus_pair_index": prediction["focus_pair_index"],
             "focus_noun_instance_id": prediction["focus_noun_instance_id"],
             "focus_action_instance_id": prediction["focus_action_instance_id"],
-            "used_noun_embedding": noun_embedding.detach().clone(),
-            "used_noun_type": noun_type,
-            "used_noun_instance_id": noun_instance_id,
+            "used_noun_embedding": None if stored_event.noun_embedding is None else stored_event.noun_embedding.detach().clone(),
+            "used_noun_type": stored_event.noun_type,
+            "used_noun_instance_id": stored_event.noun_instance_id,
+            "predicted_event": stored_event,
+            "predicted_event_dict": stored_event.as_dict(),
         }
 
     def autoregressive_rollout(

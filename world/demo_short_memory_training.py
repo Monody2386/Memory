@@ -41,18 +41,25 @@ def build_demo_memory(model: WorldModel) -> ScoredTensorQueue:
 
 def evaluate_model(model: WorldModel, memory: ScoredTensorQueue, action_type: int, target_type: int):
     with torch.no_grad():
-        prediction = model.predict_from_short_memory(memory, action_type=action_type)
+        prediction = model.predict_next_event(memory, action_type=action_type, score=0.5)
         pred_action = prediction["pred_action"]
         pred_type = prediction["pred_action_type"]
         target_embedding = model.get_action_embedding(target_type).detach().clone()
         loss = torch.nn.functional.mse_loss(pred_action, target_embedding).item()
         top_indices, top_scores = model.infer_action_type(pred_action, top_k=model.model_count)
+        predicted_event = prediction["predicted_event_dict"]
 
     return {
         "loss": loss,
         "pred_type": int(pred_type),
         "top_indices": top_indices.tolist(),
         "top_scores": [round(float(score.detach().cpu().item()), 4) for score in top_scores],
+        "predicted_event": {
+            "noun_instance_id": predicted_event["noun_instance_id"],
+            "action_type": predicted_event["action_type"],
+            "time_position": predicted_event["time_position"],
+            "score": round(float(predicted_event["score"]), 3),
+        },
     }
 
 
@@ -108,7 +115,7 @@ def run_demo(
     )
 
     for epoch in range(1, num_epochs + 1):
-        result = model.training_step_from_short_memory(
+        result = model.training_step_next_event(
             short_memory=memory,
             action_type=train_action_type,
             target_action_type=target_action_type,
@@ -151,18 +158,19 @@ def run_demo(
     )
 
     next_noun_embedding = torch.cos(torch.linspace(0.0, 3.14159, noun_dim))
-    rollout = model.autoregressive_step(
-        short_memory=memory,
-        noun_embedding=next_noun_embedding,
-        action_type=train_action_type,
-        score=1.0,
-        noun_type=19,
-    )
-    print("Autoregressive step")
+    prediction = model.predict_next_event(memory, action_type=train_action_type, score=0.5)
+    predicted_event = prediction["predicted_event"]
+    predicted_event.noun_embedding = next_noun_embedding.detach().clone()
+    predicted_event.noun_type = 19
+    stored_event = model.append_predicted_event(memory, predicted_event)
+    print("Predicted event append")
     print(
         {
-            "pred_action_type": rollout["pred_action_type"],
+            "pred_action_type": prediction["pred_action_type"],
             "memory_size": len(memory),
+            "noun_instance_id": stored_event.noun_instance_id,
+            "action_instance_id": stored_event.action_instance_id,
+            "time_position": stored_event.time_position,
         }
     )
 
