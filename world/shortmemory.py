@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 
 from knowledge.relation_map import noun_dim
 
@@ -49,14 +50,33 @@ MemoryEntry = EventMemoryEntry
 
 
 class ShortMemory:
-    def __init__(self, maxlen=100, device="cpu", state_dim=None):
+    def __init__(
+        self,
+        maxlen=100,
+        device="cpu",
+        state_dim=None,
+        relation_update_mode: str = "average",
+        relation_update_frequency: str = "per_relation",
+        relation_step_scale: float = 0.1,
+        relation_clone_update_mode: str = "average",
+        relation_clone_update_frequency: str = "per_relation",
+        relation_clone_step_scale: float = 0.1,
+    ):
         self.maxlen = maxlen
         self.device = device
         self.state_dim = state_dim
+        self.relation_update_mode = relation_update_mode
+        self.relation_update_frequency = relation_update_frequency
+        self.relation_step_scale = float(relation_step_scale)
+        self.relation_clone_update_mode = relation_clone_update_mode
+        self.relation_clone_update_frequency = relation_clone_update_frequency
+        self.relation_clone_step_scale = float(relation_clone_step_scale)
         self.event_entries: List[EventMemoryEntry] = []
         self.relation_entries: List[RelationMemoryEntry] = []
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
+        self.noun_relation_memory: Dict[str, torch.Tensor] = {}
+        self.adj_relation_memory: Dict[str, torch.Tensor] = {}
         self._insert_counter = 0
 
     @property
@@ -186,6 +206,59 @@ class ShortMemory:
     def store_action_instance(self, instance_id: str, action_embedding: torch.Tensor) -> None:
         self.action_instance_memory[instance_id] = action_embedding.to(self.device).view(-1).detach().clone()
 
+    def _relation_store(self, relation_kind: str) -> Dict[str, torch.Tensor]:
+        if relation_kind == "noun_noun_relation":
+            return self.noun_relation_memory
+        if relation_kind == "adj_noun_relation":
+            return self.adj_relation_memory
+        raise ValueError(f"unsupported relation kind: {relation_kind}")
+
+    def _relation_lr(self, relation_kind: str, relation_index: int, rm, arm) -> float:
+        if relation_kind == "noun_noun_relation":
+            return float(rm.lr_relation[relation_index])
+        if relation_kind == "adj_noun_relation":
+            return float(arm.lr_adj_relation[relation_index])
+        raise ValueError(f"unsupported relation kind: {relation_kind}")
+
+    def _resolve_relation_index(self, relation_kind: str, relation_name: str, rm, arm) -> Optional[int]:
+        if relation_kind == "noun_noun_relation":
+            if relation_name not in rm.relation_list:
+                return None
+            return rm.relation_list.index(relation_name)
+        if relation_kind == "adj_noun_relation":
+            if relation_name not in arm.adj_relation_list:
+                return None
+            return arm.adj_relation_list.index(relation_name)
+        return None
+
+    def ensure_relation_clone(self, relation_kind: str, relation_name: str):
+        store = self._relation_store(relation_kind)
+        existing = store.get(relation_name)
+        if existing is not None:
+            return existing.detach().clone()
+
+        rm, arm, kt = self._load_language_context()
+        relation_index = self._resolve_relation_index(relation_kind, relation_name, rm, arm)
+        if relation_index is None:
+            return None
+
+        if relation_kind == "noun_noun_relation":
+            relation_weight = kt.knowledge_map_one.relations[relation_index].weight.detach().clone()
+        else:
+            relation_weight = kt.adj_map_one.relations[relation_index].weight.detach().clone()
+
+        store[relation_name] = relation_weight.to(self.device).detach().clone()
+        return store[relation_name].detach().clone()
+
+    def store_relation_clone(self, relation_kind: str, relation_name: str, relation_weight: torch.Tensor) -> None:
+        store = self._relation_store(relation_kind)
+        store[relation_name] = relation_weight.to(self.device).detach().clone()
+
+    def get_relation_clone(self, relation_kind: str, relation_name: str) -> Optional[torch.Tensor]:
+        store = self._relation_store(relation_kind)
+        relation_weight = store.get(relation_name)
+        return None if relation_weight is None else relation_weight.detach().clone()
+
     def _load_language_context(self):
         import importlib
         import os
@@ -227,102 +300,202 @@ class ShortMemory:
         self.store_noun_instance(instance_id, noun_embedding)
         return noun_idx, noun_embedding.detach().clone(), instance_id
 
-    def _apply_adjective_relation_update(
+    def _relation_loss_for_entry(
         self,
-        relation_name: str,
-        target_text: str,
-        noun_idx: int,
+        entry: RelationMemoryEntry,
         noun_embedding: torch.Tensor,
+        rm,
         arm,
         kt,
     ) -> Optional[torch.Tensor]:
-        if relation_name not in arm.adj_relation_list:
-            return None
-        adjective_key = target_text.lower()
-        if adjective_key not in arm.adjective_list:
-            arm.adjective_list.append(adjective_key)
-        adjective_idx = arm.adjective_list.index(adjective_key)
-        relation_type = arm.adj_relation_list.index(relation_name) + 1
-        rel_idx = int(relation_type) - 1
-        target_embedding = kt.adj_map_one.adjective_embedding.weight.data[adjective_idx]
-        relation_weight = kt.adj_map_one.relations[rel_idx].weight.data
-        predicted_target = relation_weight @ noun_embedding
-        return torch.nn.functional.mse_loss(predicted_target, target_embedding)
+        if entry.relation_kind == "adj_noun_relation":
+            relation_weight = self.ensure_relation_clone(entry.relation_kind, entry.relation_name)
+            if relation_weight is None:
+                return None
+            adjective_key = entry.target_text.lower()
+            if adjective_key not in arm.adjective_list:
+                arm.adjective_list.append(adjective_key)
+            adjective_idx = arm.adjective_list.index(adjective_key)
+            target_embedding = kt.adj_map_one.adjective_embedding.weight.data[adjective_idx]
+            predicted_target = relation_weight @ noun_embedding
+            return F.mse_loss(predicted_target, target_embedding)
 
-    def _apply_noun_relation_update(
-        self,
-        relation_name: str,
-        target_text: str,
-        target_instance_id: Optional[str],
-        noun_embedding: torch.Tensor,
-        rm,
-        kt,
-    ) -> Optional[torch.Tensor]:
-        if relation_name not in rm.relation_list:
-            return None
-        relation_type = rm.relation_list.index(relation_name) + 1
-        rel_idx = int(relation_type) - 1
-        target_embedding = self.get_noun_embedding(target_instance_id) if target_instance_id is not None else None
-        if target_embedding is None:
-            _, target_embedding, _ = self.ensure_noun_instance(target_text, target_instance_id)
-        else:
-            target_embedding = target_embedding.detach().clone()
-        relation_weight = kt.knowledge_map_one.relations[rel_idx].weight.data
-        predicted_target = relation_weight @ noun_embedding
-        return torch.nn.functional.mse_loss(predicted_target, target_embedding)
+        if entry.relation_kind == "noun_noun_relation":
+            relation_weight = self.ensure_relation_clone(entry.relation_kind, entry.relation_name)
+            if relation_weight is None:
+                return None
+            target_embedding = self.get_noun_embedding(entry.target_instance_id)
+            if target_embedding is None:
+                _, target_embedding, _ = self.ensure_noun_instance(entry.target_text, entry.target_instance_id)
+            else:
+                target_embedding = target_embedding.detach().clone()
+            predicted_target = relation_weight @ noun_embedding
+            return F.mse_loss(predicted_target, target_embedding)
 
-    def apply_relation_to_noun_instance(
-        self,
-        relation_name: str,
-        relation_kind: str,
-        source_text: str,
-        target_text: str,
-        source_instance_id: Optional[str],
-        target_instance_id: Optional[str] = None,
-        step_scale: float = 0.1,
-    ):
+        return None
+
+    def _collect_source_relations(self, source_instance_id: str) -> List[RelationMemoryEntry]:
+        return [
+            entry
+            for entry in self.relation_entries
+            if entry.source_instance_id == source_instance_id
+            and entry.relation_kind in {"adj_noun_relation", "noun_noun_relation"}
+        ]
+
+    def _collect_relation_entries(self, relation_kind: str, relation_name: str) -> List[RelationMemoryEntry]:
+        return [
+            entry
+            for entry in self.relation_entries
+            if entry.relation_kind == relation_kind and entry.relation_name == relation_name
+        ]
+
+    def rebuild_instance_embedding(self, source_instance_id: Optional[str], step_scale: Optional[float] = None):
         if source_instance_id is None:
             return None
 
+        relevant_entries = self._collect_source_relations(source_instance_id)
+        if not relevant_entries:
+            return self.get_noun_embedding(source_instance_id)
+
         rm, arm, kt = self._load_language_context()
-        noun_idx, noun_embedding, resolved_instance_id = self.ensure_noun_instance(
-            source_text,
+        source_entry = relevant_entries[-1]
+        noun_idx, base_embedding, resolved_instance_id = self.ensure_noun_instance(
+            source_entry.source_text,
             source_instance_id,
+            noun_type=source_entry.source_type,
         )
-        noun_embedding = noun_embedding.clone().detach().requires_grad_(True)
+        noun_embedding = base_embedding.clone().detach().requires_grad_(True)
 
-        if relation_kind == "adj_noun_relation":
-            loss = self._apply_adjective_relation_update(
-                relation_name=relation_name,
-                target_text=target_text,
-                noun_idx=noun_idx,
-                noun_embedding=noun_embedding,
-                arm=arm,
-                kt=kt,
-            )
-        elif relation_kind == "noun_noun_relation":
-            loss = self._apply_noun_relation_update(
-                relation_name=relation_name,
-                target_text=target_text,
-                target_instance_id=target_instance_id,
-                noun_embedding=noun_embedding,
-                rm=rm,
-                kt=kt,
-            )
-        else:
+        losses = []
+        for entry in relevant_entries:
+            loss = self._relation_loss_for_entry(entry, noun_embedding, rm, arm, kt)
+            if loss is not None:
+                losses.append(loss)
+
+        if not losses:
             return noun_embedding.detach().clone()
 
-        if loss is None:
-            return noun_embedding.detach().clone()
+        total_loss = torch.stack(losses).mean()
+        total_loss.backward()
 
-        loss.backward()
+        scale = self.relation_step_scale if step_scale is None else float(step_scale)
         with torch.no_grad():
-            lr = float(rm.lr_per_embedding[noun_idx]) * float(step_scale)
+            lr = float(rm.lr_per_embedding[noun_idx]) * scale
             adjusted_noun_embedding = noun_embedding - lr * noun_embedding.grad
 
         noun_embedding.grad.zero_()
         self.store_noun_instance(resolved_instance_id, adjusted_noun_embedding.detach())
         return adjusted_noun_embedding.detach().clone()
+
+    def rebuild_relation_clone(
+        self,
+        relation_kind: str,
+        relation_name: str,
+        step_scale: Optional[float] = None,
+    ):
+        relevant_entries = self._collect_relation_entries(relation_kind, relation_name)
+        if not relevant_entries:
+            return self.get_relation_clone(relation_kind, relation_name)
+
+        rm, arm, kt = self._load_language_context()
+        relation_index = self._resolve_relation_index(relation_kind, relation_name, rm, arm)
+        if relation_index is None:
+            return None
+
+        base_relation_weight = self.ensure_relation_clone(relation_kind, relation_name)
+        if base_relation_weight is None:
+            return None
+
+        relation_weight = base_relation_weight.clone().detach().requires_grad_(True)
+        losses = []
+
+        for entry in relevant_entries:
+            source_embedding = self.get_noun_embedding(entry.source_instance_id)
+            if source_embedding is None:
+                _, source_embedding, _ = self.ensure_noun_instance(
+                    entry.source_text,
+                    entry.source_instance_id,
+                    noun_type=entry.source_type,
+                )
+            else:
+                source_embedding = source_embedding.detach().clone()
+
+            if relation_kind == "noun_noun_relation":
+                target_embedding = self.get_noun_embedding(entry.target_instance_id)
+                if target_embedding is None:
+                    _, target_embedding, _ = self.ensure_noun_instance(
+                        entry.target_text,
+                        entry.target_instance_id,
+                        noun_type=entry.target_type,
+                    )
+                else:
+                    target_embedding = target_embedding.detach().clone()
+            else:
+                adjective_key = entry.target_text.lower()
+                if adjective_key not in arm.adjective_list:
+                    arm.adjective_list.append(adjective_key)
+                adjective_idx = arm.adjective_list.index(adjective_key)
+                target_embedding = kt.adj_map_one.adjective_embedding.weight.data[adjective_idx].detach().clone()
+
+            predicted_target = relation_weight @ source_embedding
+            losses.append(F.mse_loss(predicted_target, target_embedding))
+
+        if not losses:
+            return relation_weight.detach().clone()
+
+        total_loss = torch.stack(losses).mean()
+        total_loss.backward()
+
+        scale = self.relation_clone_step_scale if step_scale is None else float(step_scale)
+        lr = self._relation_lr(relation_kind, relation_index, rm, arm) * scale
+        with torch.no_grad():
+            adjusted_relation_weight = relation_weight - lr * relation_weight.grad
+
+        relation_weight.grad.zero_()
+        self.store_relation_clone(relation_kind, relation_name, adjusted_relation_weight.detach())
+        return adjusted_relation_weight.detach().clone()
+
+    def update_relation_clone(
+        self,
+        relation_kind: str,
+        relation_name: str,
+        step_scale: Optional[float] = None,
+    ):
+        if self.relation_clone_update_mode != "average":
+            raise ValueError("unsupported relation_clone_update_mode")
+        return self.rebuild_relation_clone(
+            relation_kind=relation_kind,
+            relation_name=relation_name,
+            step_scale=step_scale,
+        )
+
+    def update_all_relation_clones(
+        self,
+        relation_kind: Optional[str] = None,
+        step_scale: Optional[float] = None,
+    ):
+        updated = []
+        seen = set()
+        for entry in self.relation_entries:
+            if relation_kind is not None and entry.relation_kind != relation_kind:
+                continue
+            key = (entry.relation_kind, entry.relation_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            clone = self.update_relation_clone(
+                relation_kind=entry.relation_kind,
+                relation_name=entry.relation_name,
+                step_scale=step_scale,
+            )
+            updated.append(
+                {
+                    "relation_kind": entry.relation_kind,
+                    "relation_name": entry.relation_name,
+                    "updated": clone is not None,
+                }
+            )
+        return updated
 
     def get_noun_embedding(self, instance_id: Optional[str]) -> Optional[torch.Tensor]:
         if instance_id is None:
@@ -460,18 +633,6 @@ class ShortMemory:
                     noun_type=target_type,
                 )
 
-        if relation_kind in {"adj_noun_relation", "noun_noun_relation"}:
-            updated_embedding = self.apply_relation_to_noun_instance(
-                relation_name=relation_name,
-                relation_kind=relation_kind,
-                source_text=source_text,
-                target_text=target_text,
-                source_instance_id=source_instance_id,
-                target_instance_id=target_instance_id,
-            )
-            if updated_embedding is not None:
-                self.store_noun_instance(source_instance_id, updated_embedding)
-
         base_info_pair = {
             "pair_kind": relation_kind,
             "relation_name": relation_name,
@@ -504,6 +665,15 @@ class ShortMemory:
         self.relation_entries.append(entry)
         self._insert_counter += 1
         self._sort_relation_entries()
+        self.ensure_relation_clone(relation_kind, relation_name)
+
+        if (
+            self.relation_update_mode == "average"
+            and self.relation_update_frequency == "per_relation"
+            and source_instance_id is not None
+        ):
+            self.rebuild_instance_embedding(source_instance_id)
+
         self._trim()
         return dict(entry.info_pair)
 
@@ -690,6 +860,8 @@ class ShortMemory:
         self.relation_entries.clear()
         self.noun_instance_memory.clear()
         self.action_instance_memory.clear()
+        self.noun_relation_memory.clear()
+        self.adj_relation_memory.clear()
 
 
 ScoredTensorQueue = ShortMemory
