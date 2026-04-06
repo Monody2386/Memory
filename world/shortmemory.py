@@ -721,6 +721,29 @@ class ShortMemory:
         self._sort_event_entries()
         self._sort_relation_entries()
 
+    def focus_instance(self, instance_id: str, target_score: float = 100.0):
+        event_count = 0
+        relation_count = 0
+
+        for entry in self.event_entries:
+            if entry.noun_instance_id == instance_id:
+                entry.score = max(float(entry.score), float(target_score))
+                event_count += 1
+
+        for entry in self.relation_entries:
+            if entry.source_instance_id == instance_id or entry.target_instance_id == instance_id:
+                entry.score = max(float(entry.score), float(target_score))
+                relation_count += 1
+
+        self._reorder_event_entries_for_world_model()
+        self._sort_relation_entries()
+        return {
+            "instance_id": instance_id,
+            "event_count": event_count,
+            "relation_count": relation_count,
+            "target_score": float(target_score),
+        }
+
     def get_stack(self):
         if len(self.event_entries) == 0:
             return (

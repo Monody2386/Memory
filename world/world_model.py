@@ -316,44 +316,66 @@ class WorldModel(nn.Module):
         target_action_type=None,
         optimizer=None,
         steps=None,
+        epochs: int = 10,
     ):
         optimizer = optimizer or self.build_optimizer()
-        prediction = self.predict_from_short_memory(
-            short_memory, action_type, steps=steps
-        )
-        pred_action = prediction["pred_action"]
-        pred_action_type = prediction["pred_action_type"]
+        epochs = max(1, int(epochs))
 
-        if target_action_embedding is None:
-            if target_action_type is None:
-                raise ValueError("Provide target_action_embedding or target_action_type")
-            target_action_embedding = self.get_action_embedding(target_action_type)
-        else:
-            target_action_embedding = target_action_embedding.to(
-                pred_action.device, dtype=pred_action.dtype
+        target_embedding = None
+        last_prediction = None
+        last_pred_action = None
+        last_pred_action_type = None
+        last_loss = None
+        loss_history = []
+
+        for _ in range(epochs):
+            prediction = self.predict_from_short_memory(
+                short_memory, action_type, steps=steps
             )
+            pred_action = prediction["pred_action"]
+            pred_action_type = prediction["pred_action_type"]
 
-        target_action_embedding = target_action_embedding.view(-1)
-        loss = F.mse_loss(pred_action, target_action_embedding)
+            if target_action_embedding is None:
+                if target_action_type is None:
+                    raise ValueError("Provide target_action_embedding or target_action_type")
+                current_target_embedding = self.get_action_embedding(target_action_type)
+            else:
+                current_target_embedding = target_action_embedding.to(
+                    pred_action.device, dtype=pred_action.dtype
+                )
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            current_target_embedding = current_target_embedding.view(-1)
+            loss = F.mse_loss(pred_action, current_target_embedding)
 
-        with torch.no_grad():
-            self.action_embeddings.weight[0].zero_()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                self.action_embeddings.weight[0].zero_()
+
+            target_embedding = current_target_embedding.detach().clone()
+            last_prediction = prediction
+            last_pred_action = pred_action.detach()
+            last_pred_action_type = int(pred_action_type)
+            last_loss = float(loss.item())
+            loss_history.append(last_loss)
 
         return {
-            "loss": float(loss.item()),
-            "pred_action": pred_action.detach(),
-            "pred_action_type": int(pred_action_type),
-            "focus_noun_embedding": prediction["focus_noun_embedding"],
-            "focus_noun_type": prediction["focus_noun_type"],
-            "focus_action_type": prediction["focus_action_type"],
-            "focus_time_position": prediction["focus_time_position"],
-            "focus_pair_index": prediction["focus_pair_index"],
-            "focus_noun_instance_id": prediction["focus_noun_instance_id"],
-            "focus_action_instance_id": prediction["focus_action_instance_id"],
+            "loss": float(last_loss),
+            "loss_history": loss_history,
+            "epochs": epochs,
+            "target_action_type": None if target_action_type is None else int(target_action_type),
+            "pred_action": last_pred_action,
+            "pred_action_type": last_pred_action_type,
+            "target_action_embedding": target_embedding,
+            "focus_noun_embedding": last_prediction["focus_noun_embedding"],
+            "focus_noun_type": last_prediction["focus_noun_type"],
+            "focus_action_type": last_prediction["focus_action_type"],
+            "focus_time_position": last_prediction["focus_time_position"],
+            "focus_pair_index": last_prediction["focus_pair_index"],
+            "focus_noun_instance_id": last_prediction["focus_noun_instance_id"],
+            "focus_action_instance_id": last_prediction["focus_action_instance_id"],
         }
 
     def training_step_from_short_memory(
@@ -364,6 +386,7 @@ class WorldModel(nn.Module):
         target_action_type=None,
         optimizer=None,
         steps=None,
+        epochs: int = 10,
     ):
         return self.training_step_next_event(
             short_memory=short_memory,
@@ -372,6 +395,7 @@ class WorldModel(nn.Module):
             target_action_type=target_action_type,
             optimizer=optimizer,
             steps=steps,
+            epochs=epochs,
         )
 
     def autoregressive_step(

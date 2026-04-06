@@ -2,7 +2,9 @@
 
 1. tokenizer
 2. part-of-speech analysis
-3. information extraction by sentence pattern
+3. instance resolution
+4. information extraction by sentence pattern
+5. time-step rules
 
 At the current stage the parser is intentionally rule-based. The grammar core is
 not responsible for learning arbitrary sentence semantics. Instead, each known
@@ -314,7 +316,19 @@ def _resolve_relation_phrase(tokens: Sequence[str], relation_list: Sequence[str]
     return candidates[0]
 
 
-def tag_tokens(sentence: str) -> List[TaggedToken]:
+def _coerce_instance_context(instance_context=None, short_memory=None):
+    if instance_context is not None:
+        return instance_context
+    if short_memory is None:
+        return None
+    return build_instance_context_from_memory(short_memory)
+
+
+def tag_tokens(
+    sentence: str,
+    instance_context=None,
+    short_memory=None,
+) -> List[TaggedToken]:
     tokens = tokenize_sentence(sentence)
     lexicons = _build_pos_lexicons()
     relation_match = _resolve_relation_phrase(tokens, lexicons["relations"])
@@ -344,21 +358,107 @@ def tag_tokens(sentence: str) -> List[TaggedToken]:
         if tagged_tokens[1].source == "default_guess":
             tagged_tokens[1].source = "position_heuristic"
 
-    _assign_noun_instance_ids(tagged_tokens)
+    resolved_instance_context = _coerce_instance_context(
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    _assign_noun_instance_ids(tagged_tokens, instance_context=resolved_instance_context)
     return tagged_tokens
 
 
-def sentence_structure(sentence: str) -> Tuple[str, ...]:
-    return tuple(token.pos for token in tag_tokens(sentence))
+def sentence_structure(
+    sentence: str,
+    instance_context=None,
+    short_memory=None,
+) -> Tuple[str, ...]:
+    return tuple(
+        token.pos for token in tag_tokens(
+            sentence,
+            instance_context=instance_context,
+            short_memory=short_memory,
+        )
+    )
 
 
-def _assign_noun_instance_ids(tagged_tokens: Sequence[TaggedToken]) -> None:
+def build_instance_context_from_memory(short_memory) -> Dict[str, object]:
+    context: Dict[str, object] = {
+        "focus_instance_id": None,
+        "focus_noun_text": None,
+        "by_noun": {},
+    }
+    if short_memory is None:
+        return context
+
+    focus_entry = short_memory.get_focus_entry() if hasattr(short_memory, "get_focus_entry") else None
+    if focus_entry is not None:
+        context["focus_instance_id"] = focus_entry.noun_instance_id
+        context["focus_noun_text"] = None if focus_entry.noun_text is None else focus_entry.noun_text.lower()
+
+    def register(noun_text: Optional[str], instance_id: Optional[str], time_position: int, pair_index: int):
+        if noun_text is None or instance_id is None:
+            return
+        noun_key = noun_text.lower()
+        bucket = context["by_noun"].setdefault(noun_key, [])
+        for existing_time, existing_pair, existing_instance_id in bucket:
+            if existing_instance_id == instance_id:
+                return
+        bucket.append((int(time_position), int(pair_index), instance_id))
+
+    for entry in getattr(short_memory, "short_memory_event", []):
+        register(entry.noun_text, entry.noun_instance_id, entry.time_position, entry.pair_index)
+
+    for entry in getattr(short_memory, "short_memory_relation", []):
+        register(entry.source_text, entry.source_instance_id, entry.time_position, entry.pair_index)
+        register(entry.target_text, entry.target_instance_id, entry.time_position, entry.pair_index)
+
+    for noun_key, bucket in context["by_noun"].items():
+        bucket.sort(key=lambda item: (item[0], item[1]))
+        context["by_noun"][noun_key] = [instance_id for _, _, instance_id in bucket]
+
+    return context
+
+
+def _resolve_existing_instance_id(
+    noun_text: str,
+    instance_context,
+    sentence_assignments: Dict[str, str],
+) -> Optional[str]:
+    noun_key = noun_text.lower()
+    if noun_key in sentence_assignments:
+        return sentence_assignments[noun_key]
+    if not instance_context:
+        return None
+
+    focus_noun_text = instance_context.get("focus_noun_text")
+    focus_instance_id = instance_context.get("focus_instance_id")
+    if focus_noun_text == noun_key and focus_instance_id is not None:
+        return focus_instance_id
+
+    candidates = instance_context.get("by_noun", {}).get(noun_key, [])
+    if candidates:
+        return candidates[-1]
+    return None
+
+
+def _assign_noun_instance_ids(
+    tagged_tokens: Sequence[TaggedToken],
+    instance_context=None,
+) -> None:
     noun_occurrence = 0
+    sentence_assignments: Dict[str, str] = {}
     for token in tagged_tokens:
         if token.pos != "noun":
             continue
         noun_occurrence += 1
-        token.instance_id = f"{token.text}#{token.index}:{noun_occurrence}"
+        resolved_instance_id = _resolve_existing_instance_id(
+            token.text,
+            instance_context,
+            sentence_assignments,
+        )
+        if resolved_instance_id is None:
+            resolved_instance_id = f"{token.text}#{token.index}:{noun_occurrence}"
+        sentence_assignments.setdefault(token.text.lower(), resolved_instance_id)
+        token.instance_id = resolved_instance_id
 
 
 def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
@@ -387,7 +487,12 @@ def classify_sentence_type(sentence: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. Information extraction by sentence pattern
+# 3. Instance resolution
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 4. Information extraction by sentence pattern
 # ---------------------------------------------------------------------------
 
 def _parse_noun_phrase(tokens: Sequence[str], tags: Sequence[TaggedToken]) -> Tuple[str, List[str], Optional[str]]:
@@ -571,10 +676,16 @@ def parse_sentence(
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
     infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
 ) -> ParsedSentence:
     del noun_relation_type  # grammar parses structure; routing decides how to use relation configs.
     tokens = tokenize_sentence(sentence)
-    tagged_tokens = tag_tokens(sentence)
+    tagged_tokens = tag_tokens(
+        sentence,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
     extractor = _select_extractor(tokens, tagged_tokens)
     parsed = extractor(
         tokens,
@@ -586,6 +697,57 @@ def parse_sentence(
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# 5. Time-step rules
+# ---------------------------------------------------------------------------
+
+def _memory_last_time_position(short_memory) -> int:
+    if short_memory is None:
+        return -1
+    time_positions = [entry.time_position for entry in getattr(short_memory, "short_memory_event", [])]
+    time_positions.extend(entry.time_position for entry in getattr(short_memory, "short_memory_relation", []))
+    if not time_positions:
+        return -1
+    return int(max(time_positions))
+
+
+def _parsed_action_uses_existing_instance(parsed: ParsedSentence, short_memory) -> bool:
+    if short_memory is None:
+        return False
+    existing_instance_ids = {
+        entry.noun_instance_id
+        for entry in getattr(short_memory, "short_memory_event", [])
+        if entry.noun_instance_id is not None
+    }
+    for action_tuple in parsed.action_tuples:
+        if action_tuple.noun_instance_id in existing_instance_ids:
+            return True
+    return False
+
+
+def determine_time_position(
+    parsed: ParsedSentence,
+    *,
+    short_memory=None,
+    explicit_time_position: Optional[int] = None,
+    default_time_position: int = 0,
+    rule_name: str = "existing_action_instance_advances",
+) -> int:
+    if explicit_time_position is not None:
+        return int(explicit_time_position)
+
+    last_time_position = _memory_last_time_position(short_memory)
+    if last_time_position < 0:
+        return int(default_time_position)
+
+    if rule_name == "existing_action_instance_advances":
+        if _parsed_action_uses_existing_instance(parsed, short_memory):
+            return last_time_position + 1
+        return last_time_position
+
+    raise ValueError(f"Unknown time-step rule: {rule_name}")
+
+
 def sentence_to_knowledge_samples(
     sentence: str,
     noun_relation_type: Optional[RelationOverride] = None,
@@ -593,12 +755,16 @@ def sentence_to_knowledge_samples(
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
     infer_missing: bool = False,
+    instance_context=None,
+    short_memory=None,
 ) -> KnowledgeTrainingSamples:
     parsed = parse_sentence(
         sentence,
         noun_relation_type=noun_relation_type,
         adjective_relation_types=adjective_relation_types,
         infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
     )
     rm, arm, _ = _load_language_context()
     samples = KnowledgeTrainingSamples()
@@ -701,11 +867,15 @@ def sentence_to_noun_action_pairs(
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
     infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
 ) -> List[NounActionPair]:
     parsed = parse_sentence(
         sentence,
         adjective_relation_types=adjective_relation_types,
         infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
     )
     pairs: List[NounActionPair] = []
     object_adjectives_map: Dict[str, List[str]] = {}
@@ -837,20 +1007,29 @@ def parsed_sentence_to_relation_memory_states(
 
 def sentence_to_relation_memory_states(
     sentence: str,
-    time_position: int = 0,
+    time_position: Optional[int] = None,
     adjective_relation_types: Optional[
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
     infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
 ) -> List[ShortMemoryRelationState]:
     parsed = parse_sentence(
         sentence,
         adjective_relation_types=adjective_relation_types,
         infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    resolved_time_position = determine_time_position(
+        parsed,
+        short_memory=short_memory,
+        explicit_time_position=time_position,
     )
     return parsed_sentence_to_relation_memory_states(
         parsed=parsed,
-        time_position=time_position,
+        time_position=resolved_time_position,
     )
 
 
@@ -858,20 +1037,35 @@ def sentence_to_short_memory_states(
     sentence: str,
     world_model,
     action_type_map: Optional[Dict[str, int]] = None,
-    time_position: int = 0,
+    time_position: Optional[int] = None,
     adjective_relation_types: Optional[
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
+    instance_context=None,
+    short_memory=None,
 ) -> List[ShortMemoryState]:
+    parsed = parse_sentence(
+        sentence,
+        adjective_relation_types=adjective_relation_types,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    resolved_time_position = determine_time_position(
+        parsed,
+        short_memory=short_memory,
+        explicit_time_position=time_position,
+    )
     pairs = sentence_to_noun_action_pairs(
         sentence,
         adjective_relation_types=adjective_relation_types,
+        instance_context=instance_context,
+        short_memory=short_memory,
     )
     return noun_action_pairs_to_short_memory_states(
         pairs=pairs,
         world_model=world_model,
         action_type_map=action_type_map,
-        time_position=time_position,
+        time_position=resolved_time_position,
     )
 
 
@@ -880,7 +1074,7 @@ def append_sentence_to_short_memory(
     short_memory,
     world_model,
     action_type_map: Optional[Dict[str, int]] = None,
-    time_position: int = 0,
+    time_position: Optional[int] = None,
     base_score: float = 1.0,
     adjective_relation_types: Optional[
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
@@ -889,12 +1083,18 @@ def append_sentence_to_short_memory(
     parsed = parse_sentence(
         sentence,
         adjective_relation_types=adjective_relation_types,
+        short_memory=short_memory,
+    )
+    resolved_time_position = determine_time_position(
+        parsed,
+        short_memory=short_memory,
+        explicit_time_position=time_position,
     )
     action_type_map = action_type_map or build_action_type_map(world_model)
 
     relation_states = parsed_sentence_to_relation_memory_states(
         parsed=parsed,
-        time_position=time_position,
+        time_position=resolved_time_position,
     )
 
     for relation_state in relation_states:
@@ -951,7 +1151,7 @@ def append_sentence_to_short_memory(
             action_type=action_type,
             noun_embedding=noun_embedding.view(-1).clone(),
             action_embedding=action_embedding,
-            time_position=int(time_position),
+            time_position=int(resolved_time_position),
             pair_index=pair_index,
             role=action_tuple.role,
             adjectives=list(adjectives),
@@ -993,7 +1193,7 @@ def sentences_to_short_memory(
     short_memory,
     world_model,
     action_type_map: Optional[Dict[str, int]] = None,
-    start_time_position: int = 0,
+    start_time_position: Optional[int] = None,
     base_score: float = 1.0,
     adjective_relation_types: Optional[Sequence[Optional[Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]]]] = None,
 ):
@@ -1002,15 +1202,17 @@ def sentences_to_short_memory(
     if len(adjective_relation_types) != len(sentences):
         raise ValueError("adjective_relation_types must align with sentences")
 
-    for offset, (sentence, relation_overrides) in enumerate(zip(sentences, adjective_relation_types)):
+    next_explicit_time_position = start_time_position
+    for sentence, relation_overrides in zip(sentences, adjective_relation_types):
         states = append_sentence_to_short_memory(
             sentence=sentence,
             short_memory=short_memory,
             world_model=world_model,
             action_type_map=action_type_map,
-            time_position=start_time_position + offset,
+            time_position=next_explicit_time_position,
             base_score=base_score,
             adjective_relation_types=relation_overrides,
         )
         all_states.append(states)
+        next_explicit_time_position = None
     return all_states

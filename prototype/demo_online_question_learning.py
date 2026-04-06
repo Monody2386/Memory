@@ -24,25 +24,10 @@ def describe_question(question: ProposedQuestion):
     }
 
 
-def re_predict(consciousness: Consciousness, question: ProposedQuestion) -> ProposedQuestion:
-    engine = consciousness.question
-    if question.kind == "adj_noun":
-        return engine.predict_adjective(question.source_noun, question.relation_type)
-    if question.question_target == "noun":
-        return engine.predict_noun_from_relation(question.source_noun, question.relation_type)
-    return engine.predict_relation_between_nouns(question.source_noun, question.target_noun)
-
-
 def print_defined_vocab(consciousness: Consciousness):
-    rm, arm, _ = consciousness.question._ctx()
-    defined_nouns = [noun for noun in rm.noun_list if not noun.startswith("noun_")]
-    defined_adjectives = [adj for adj in arm.adjective_list if not adj.startswith("adj_")]
-
     print()
     print("Defined vocabulary")
-    print({"noun_list": defined_nouns})
-    print({"adj_list": defined_adjectives})
-    print({"relation_list": list(rm.relation_list)})
+    print(consciousness.inspect_vocab())
 
 
 def prompt_mode() -> str:
@@ -198,7 +183,7 @@ def run_demo(seed: int = 7):
                 print_defined_vocab(consciousness)
                 return
 
-            updated_question = re_predict(consciousness, question)
+            updated_question = consciousness.re_predict_question(question)
             print()
             print("Learning result")
             print(result)
