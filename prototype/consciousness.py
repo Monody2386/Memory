@@ -290,6 +290,7 @@ class Consciousness:
             dict: existence flag, embedding norm, and related entries.
         """
         noun_embedding = self.short_memory.get_noun_embedding(instance_id)
+        metadata = self.short_memory.get_noun_instance_metadata(instance_id)
         related_events = [
             self._event_entry_to_dict(entry)
             for entry in self.short_memory.short_memory_event
@@ -304,6 +305,7 @@ class Consciousness:
             "instance_id": instance_id,
             "exists": noun_embedding is not None,
             "embedding_norm": None if noun_embedding is None else float(noun_embedding.norm().item()),
+            "metadata": metadata,
             "event_count": len(related_events),
             "relation_count": len(related_relations),
             "events": related_events,
@@ -349,6 +351,32 @@ class Consciousness:
             "instance_id": instance_id,
             "updated": embedding is not None,
             "embedding_norm": None if embedding is None else float(embedding.norm().item()),
+        }
+
+    def set_instance_profile(
+        self,
+        instance_id: str,
+        *,
+        entity_kind: Optional[str] = None,
+        gender: Optional[str] = None,
+    ):
+        """Update lightweight metadata for one noun instance.
+
+        Input:
+            instance_id: noun instance identifier.
+            entity_kind: one of person, object, unknown.
+            gender: one of male, female, unknown.
+        Output:
+            dict: updated instance metadata.
+        """
+        metadata = self.short_memory.update_noun_instance_metadata(
+            instance_id,
+            entity_kind=entity_kind,
+            gender=gender,
+        )
+        return {
+            "instance_id": instance_id,
+            "metadata": metadata,
         }
 
     def focus_instance(self, instance_id: str, *, target_score: float = 100.0):
@@ -479,6 +507,75 @@ class Consciousness:
             "saved": bool(save),
             "target_model": target_model,
             "norm": float(clone.norm().item()),
+        }
+
+    def clear_short_memory(self):
+        """Clear all short-memory content and instance/relation caches.
+
+        Input:
+            None.
+        Output:
+            dict: memory sizes before and after clearing.
+        """
+        before = {
+            "event_count": len(self.short_memory.short_memory_event),
+            "relation_count": len(self.short_memory.short_memory_relation),
+            "noun_instance_count": len(self.short_memory.noun_instance_memory),
+            "action_instance_count": len(self.short_memory.action_instance_memory),
+            "noun_relation_clone_count": len(self.short_memory.noun_relation_memory),
+            "adj_relation_clone_count": len(self.short_memory.adj_relation_memory),
+        }
+        self.short_memory.clear()
+        after = {
+            "event_count": len(self.short_memory.short_memory_event),
+            "relation_count": len(self.short_memory.short_memory_relation),
+            "noun_instance_count": len(self.short_memory.noun_instance_memory),
+            "action_instance_count": len(self.short_memory.action_instance_memory),
+            "noun_relation_clone_count": len(self.short_memory.noun_relation_memory),
+            "adj_relation_clone_count": len(self.short_memory.adj_relation_memory),
+        }
+        return {
+            "before": before,
+            "after": after,
+        }
+
+    def train_joint_knowledge(self, *, save: bool = True):
+        """Run one joint-average training step for knowledge_map and adj_map.
+
+        Input:
+            save: whether to persist the updated long-term models and learning-rate maps.
+        Output:
+            dict: training summary.
+        """
+        import importlib
+
+        training = importlib.import_module("knowledge.training")
+        training._load_training_state()
+        relation_map, _, _, lr_per_embedding, lr_relation = training.rm.load_relation_data()
+        adj_relation_map, _, _, lr_per_adjective, lr_adj_relation = training.arm.load_adj_relation_data()
+        if adj_relation_map is False:
+            raise FileNotFoundError(
+                "adj_relation_data.npz not found. Generate adjective relation data before joint training."
+            )
+
+        training.train_joint_average(
+            knowledge_map_one=training.knowledge_map_one,
+            adj_map_one=training.adj_map_one,
+            relation_map=relation_map,
+            adj_relation_map=adj_relation_map,
+            lr_per_embedding=lr_per_embedding,
+            lr_relation=lr_relation,
+            lr_per_adjective=lr_per_adjective,
+            lr_adj_relation=lr_adj_relation,
+        )
+        if save:
+            training._save_training_state()
+
+        return {
+            "trained": True,
+            "saved": bool(save),
+            "knowledge_embedding_norm": float(training.knowledge_map_one.embedding.weight.norm().item()),
+            "adj_embedding_norm": float(training.adj_map_one.adjective_embedding.weight.norm().item()),
         }
 
     def build_world_input(self, steps=None):
@@ -774,6 +871,227 @@ class Consciousness:
             "relation_list": list(rm.relation_list),
         }
 
+    def resolve_relation_type(self, relation_kind: str, relation_name: str):
+        """Resolve a relation name into its discrete relation type.
+
+        Input:
+            relation_kind: relation family, such as noun_noun_relation or adj_noun_relation.
+            relation_name: relation label.
+        Output:
+            int | None: 1-based relation type if found, otherwise None.
+        """
+        rm, arm, _ = self.question._ctx()
+        relation_name = str(relation_name).lower()
+        if relation_kind == "noun_noun_relation":
+            if relation_name not in rm.relation_list:
+                return None
+            return int(rm.relation_list.index(relation_name) + 1)
+        if relation_kind == "adj_noun_relation":
+            if relation_name not in arm.adj_relation_list:
+                return None
+            return int(arm.adj_relation_list.index(relation_name) + 1)
+        raise ValueError("relation_kind must be one of: noun_noun_relation, adj_noun_relation")
+
+    def recall_noun_action(
+        self,
+        noun: Optional[str] = None,
+        action: Optional[str] = None,
+    ):
+        """Recall stored noun-action permissions from long-term noun_action memory.
+
+        Input:
+            noun: optional noun filter.
+            action: optional action filter.
+        Output:
+            list[dict]: matching noun-action memory entries.
+        """
+        import importlib
+
+        noun_action_map = importlib.import_module("knowledge.noun_action_map")
+        noun_key = None if noun is None else str(noun).lower()
+        action_key = None if action is None else str(action).lower()
+
+        if noun_key is not None and action_key is not None:
+            allowed = noun_action_map.can_noun_do_action(noun_key, action_key)
+            return [
+                {
+                    "noun": noun_key,
+                    "action": action_key,
+                    "value": 1 if allowed else 0,
+                }
+            ]
+
+        if noun_key is not None:
+            results = noun_action_map.get_actions_for_noun(noun_key, only_allowed=True)
+        elif action_key is not None:
+            results = noun_action_map.get_nouns_for_action(action_key, only_allowed=True)
+        else:
+            results = []
+            for noun_name in self.inspect_vocab()["noun_list"]:
+                results.extend(noun_action_map.get_actions_for_noun(noun_name, only_allowed=True))
+
+        normalized = []
+        for item in results:
+            current_noun = str(item.get("noun", "")).lower()
+            current_action = str(item.get("action", "")).lower()
+            if noun_key is not None and current_noun != noun_key:
+                continue
+            if action_key is not None and current_action != action_key:
+                continue
+            normalized.append(
+                {
+                    "noun": current_noun,
+                    "action": current_action,
+                    "value": int(item.get("value", 0)),
+                }
+            )
+        return normalized
+
+    def recall_relation_value(self, relation_kind: str, source_noun: str, target_value: str):
+        """Look up the exact stored value for one long-term relation slot.
+
+        Input:
+            relation_kind: noun_noun_relation or adj_noun_relation.
+            source_noun: source noun text.
+            target_value: target noun or adjective text.
+        Output:
+            int | None: stored relation type, or 0 when the slot is empty, or None if unknown.
+        """
+        rm, arm, _ = self.question._ctx()
+        source_key = str(source_noun).lower()
+        target_key = str(target_value).lower()
+
+        if source_key not in rm.noun_list:
+            return None
+        source_idx = rm.noun_list.index(source_key)
+
+        if relation_kind == "noun_noun_relation":
+            if target_key not in rm.noun_list:
+                return None
+            target_idx = rm.noun_list.index(target_key)
+            return int(rm.relation_map[source_idx, target_idx])
+
+        if relation_kind == "adj_noun_relation":
+            if target_key not in arm.adjective_list:
+                return None
+            target_idx = arm.adjective_list.index(target_key)
+            return int(arm.adj_relation_map[source_idx, target_idx])
+
+        raise ValueError("relation_kind must be one of: noun_noun_relation, adj_noun_relation")
+
+    def remember_noun_relation(
+        self,
+        source_noun: str,
+        target_noun: str,
+        relation_type: int,
+        *,
+        save: bool = True,
+    ):
+        """Write one supervised noun-noun relation into long-term relation_map.
+
+        Input:
+            source_noun: source noun text.
+            target_noun: target noun text.
+            relation_type: 1-based relation type.
+            save: whether to persist the map update.
+        Output:
+            dict: write summary including created flag and stored relation type.
+        """
+        import importlib
+
+        rm = importlib.import_module("knowledge.relation_map")
+        rm.load_relation_data()
+        created, source_idx, target_idx, stored_relation_type = rm.add_relation_by_type(
+            source_noun,
+            target_noun,
+            relation_type,
+        )
+        if save:
+            rm.save_relation_data()
+        return {
+            "kind": "noun_noun_relation",
+            "source_noun": str(source_noun).lower(),
+            "target_noun": str(target_noun).lower(),
+            "relation_type": int(stored_relation_type),
+            "created": bool(created),
+            "source_idx": int(source_idx),
+            "target_idx": int(target_idx),
+            "saved": bool(save),
+        }
+
+    def remember_adj_relation(
+        self,
+        noun: str,
+        adjective: str,
+        relation_type: int,
+        *,
+        save: bool = True,
+    ):
+        """Write one supervised adj-noun relation into long-term adj_relation_map.
+
+        Input:
+            noun: noun text.
+            adjective: adjective text.
+            relation_type: 1-based adjective relation type.
+            save: whether to persist the map update.
+        Output:
+            dict: write summary including created flag and stored relation type.
+        """
+        import importlib
+
+        arm = importlib.import_module("knowledge.adj_relation_map")
+        arm.load_adj_relation_data()
+        created, noun_idx, adjective_idx, stored_relation_type = arm.add_adj_relation_by_type(
+            noun,
+            adjective,
+            relation_type,
+        )
+        if save:
+            arm.save_adj_relation_data()
+        return {
+            "kind": "adj_noun_relation",
+            "noun": str(noun).lower(),
+            "adjective": str(adjective).lower(),
+            "relation_type": int(stored_relation_type),
+            "created": bool(created),
+            "noun_idx": int(noun_idx),
+            "adjective_idx": int(adjective_idx),
+            "saved": bool(save),
+        }
+
+    def remember_noun_action(
+        self,
+        noun: str,
+        action: str,
+        *,
+        save: bool = True,
+    ):
+        """Write one supervised noun-action relation into long-term noun_action_map.
+
+        Input:
+            noun: noun text.
+            action: action text.
+            save: whether to persist the map update.
+        Output:
+            dict: write summary including indices and stored value.
+        """
+        import importlib
+
+        noun_action_map = importlib.import_module("knowledge.noun_action_map")
+        noun_action_map.load_noun_action_data()
+        noun_idx, action_idx, value = noun_action_map.add_noun_action(noun, action)
+        if save:
+            noun_action_map.save_noun_action_data()
+        return {
+            "kind": "noun_action_relation",
+            "noun": str(noun).lower(),
+            "action": str(action).lower(),
+            "noun_idx": int(noun_idx),
+            "action_idx": int(action_idx),
+            "value": int(value),
+            "saved": bool(save),
+        }
+
     def re_predict_question(self, question: ProposedQuestion):
         """Re-run the appropriate predictor for an existing proposed question.
 
@@ -996,6 +1314,100 @@ class Consciousness:
         """
         return self.question.what_is_token(token, position=position, tokens=tokens)
 
+    def register_token_pos(self, token: str, pos: str, *, save: bool = True):
+        """Register one token as a noun, adjective, action, or relation token.
+
+        Input:
+            token: token text.
+            pos: noun, adj, action, or relation.
+            save: whether to persist the vocabulary update.
+        Output:
+            dict: token registration summary.
+        """
+        return self.question.register_token_pos(token, pos, save=save)
+
+    def register_relation_name(
+        self,
+        relation_name: str,
+        *,
+        relation_family: str = "noun_noun_relation",
+        save: bool = True,
+    ):
+        """Register one relation label into the requested long-term relation family.
+
+        Input:
+            relation_name: relation label text.
+            relation_family: noun_noun_relation or adj_noun_relation.
+            save: whether to persist the vocabulary update.
+        Output:
+            dict: relation registration summary.
+        """
+        import importlib
+
+        relation_name = str(relation_name).lower()
+        if relation_family == "noun_noun_relation":
+            result = self.question.register_token_pos(relation_name, "relation", save=save)
+            result["relation_family"] = relation_family
+            return result
+        if relation_family == "adj_noun_relation":
+            arm = importlib.import_module("knowledge.adj_relation_map")
+            arm.load_adj_relation_data()
+            created = False
+            if relation_name not in arm.adj_relation_list:
+                if len(arm.adj_relation_list) >= arm.adj_relation_num:
+                    raise ValueError(
+                        f"adj_relation_list is full; cannot register new adjective relation '{relation_name}'"
+                    )
+                arm.adj_relation_list.append(relation_name)
+                created = True
+            if save:
+                arm.save_adj_relation_data()
+            return {
+                "token": relation_name,
+                "pos": "relation",
+                "relation_family": relation_family,
+                "created": bool(created),
+                "saved": bool(save),
+            }
+        raise ValueError("relation_family must be one of: noun_noun_relation, adj_noun_relation")
+
+    def register_adjective_relation_hint(
+        self,
+        adjective: str,
+        relation_name: str,
+        *,
+        save: bool = True,
+    ):
+        """Register the default relation hint used when an adjective appears in grammar parsing.
+
+        Input:
+            adjective: adjective token.
+            relation_name: default adjective relation label.
+            save: whether to persist the updated adjective relation vocabulary.
+        Output:
+            dict: hint registration summary.
+        """
+        import importlib
+
+        grammar = importlib.import_module("prototype.grammar")
+        adjective = str(adjective).lower()
+        relation_name = str(relation_name).lower()
+        self.question.register_token_pos(adjective, "adj", save=save)
+        relation_result = self.register_relation_name(
+            relation_name,
+            relation_family="adj_noun_relation",
+            save=save,
+        )
+        previous = grammar.ADJECTIVE_RELATION_HINTS.get(adjective)
+        grammar.ADJECTIVE_RELATION_HINTS[adjective] = relation_name
+        return {
+            "adjective": adjective,
+            "relation_name": relation_name,
+            "previous_relation_name": previous,
+            "updated": previous != relation_name,
+            "saved": bool(save),
+            "relation_registration": relation_result,
+        }
     def learn_noun_relation(self, source_noun: str, target_noun: str, relation_type: int, save: bool = True):
         """Directly learn one noun-noun relation in long-term knowledge.
 
@@ -1108,3 +1520,8 @@ __all__ = [
     "available_reasoning_modes",
     "has_relation",
 ]
+
+
+
+
+

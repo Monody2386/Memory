@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 QuestionKind = Literal["adj_noun", "noun_noun"]
 NounQuestionTarget = Literal["noun", "relation"]
-TokenPos = Literal["noun", "adj", "action", "relation", "unknown"]
+TokenPos = Literal["noun", "pronoun", "possessive", "adj", "action", "relation", "unknown"]
 
 
 @dataclass
@@ -131,9 +131,12 @@ class QuestionEngine:
         relation_tokens = set()
         for relation in rm.relation_list:
             relation_tokens.update(relation.lower().split())
-        adjective_hints = set(importlib.import_module("prototype.grammar").ADJECTIVE_RELATION_HINTS.keys())
+        grammar = importlib.import_module("prototype.grammar")
+        adjective_hints = set(grammar.ADJECTIVE_RELATION_HINTS.keys())
         return {
             "nouns": {noun.lower() for noun in rm.noun_list},
+            "pronouns": set(grammar.PRONOUN_LIST),
+            "possessives": set(grammar.POSSESSIVE_LIST),
             "adjectives": set(arm.adjective_list) | adjective_hints,
             "actions": {action.lower() for action in action_vocab.action_list},
             "relations": {relation.lower() for relation in rm.relation_list},
@@ -160,6 +163,24 @@ class QuestionEngine:
                 prompt=f"'{token}' is already known as a noun.",
                 candidates=["noun"],
                 source="noun_list",
+            )
+        if token in lexicons["possessives"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="possessive",
+                status="known",
+                prompt=f"'{token}' is already known as a possessive marker.",
+                candidates=["possessive"],
+                source="possessive_list",
+            )
+        if token in lexicons["pronouns"]:
+            return TokenWhatResult(
+                token=token,
+                predicted_pos="pronoun",
+                status="known",
+                prompt=f"'{token}' is already known as a pronoun.",
+                candidates=["pronoun"],
+                source="pronoun_list",
             )
         if token in lexicons["adjectives"]:
             return TokenWhatResult(
@@ -205,14 +226,14 @@ class QuestionEngine:
 
         prompt = (
             f"I do not know the token '{token}'. What is it in this sentence: "
-            f"noun, adj, action, or relation? Current best guess: {guessed_pos}."
+            f"noun, pronoun, possessive, adj, action, or relation? Current best guess: {guessed_pos}."
         )
         return TokenWhatResult(
             token=token,
             predicted_pos=guessed_pos,
             status="question",
             prompt=prompt,
-            candidates=["noun", "adj", "action", "relation"],
+            candidates=["noun", "pronoun", "possessive", "adj", "action", "relation"],
             source=source,
         )
 
@@ -227,6 +248,10 @@ class QuestionEngine:
             if token not in rm.noun_list:
                 rm._ensure_noun(token)
                 created = True
+        elif pos == "pronoun":
+            created = False
+        elif pos == "possessive":
+            created = False
         elif pos == "adj":
             if token not in arm.adjective_list:
                 arm._ensure_adjective(token)
@@ -245,7 +270,7 @@ class QuestionEngine:
                 rm.relation_list.append(token)
                 created = True
         else:
-            raise ValueError("pos must be one of: noun, adj, action, relation")
+            raise ValueError("pos must be one of: noun, pronoun, possessive, adj, action, relation")
 
         if save:
             rm.save_relation_data()

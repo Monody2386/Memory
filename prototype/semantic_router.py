@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from knowledge import adj_relation_map as arm
 from knowledge import relation_map as rm
-from knowledge.noun_action_map import add_noun_action
 from knowledge.training import apply_language_training_samples
 from .grammar import (
     AdjNounRelationSample,
@@ -148,15 +147,12 @@ def _store_adj_noun_relations(samples: Sequence[AdjNounRelationSample]) -> List[
 def _store_noun_action_pairs(pairs: Sequence[NounActionPair]) -> List[Dict[str, Any]]:
     updates: List[Dict[str, Any]] = []
     for pair in pairs:
-        noun_idx, action_idx, value = add_noun_action(pair.noun, pair.action)
         updates.append(
             {
                 "noun": pair.noun,
                 "action": pair.action,
                 "role": pair.role,
-                "noun_idx": int(noun_idx),
-                "action_idx": int(action_idx),
-                "value": int(value),
+                "value": 0,
             }
         )
     return updates
@@ -242,3 +238,4 @@ __all__ = [
     "process_sentence",
     "route_sentence",
 ]
+

@@ -3,6 +3,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+
+from prototype.instance_metadata import default_entity_kind, default_gender
+
 import torch
 import torch.nn.functional as F
 
@@ -74,6 +77,7 @@ class ShortMemory:
         self.event_entries: List[EventMemoryEntry] = []
         self.relation_entries: List[RelationMemoryEntry] = []
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
+        self.noun_instance_metadata: Dict[str, Dict[str, Any]] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_relation_memory: Dict[str, torch.Tensor] = {}
         self.adj_relation_memory: Dict[str, torch.Tensor] = {}
@@ -181,6 +185,9 @@ class ShortMemory:
         self.noun_instance_memory = {
             key: value for key, value in self.noun_instance_memory.items() if key in referenced_nouns
         }
+        self.noun_instance_metadata = {
+            key: value for key, value in self.noun_instance_metadata.items() if key in referenced_nouns
+        }
         self.action_instance_memory = {
             key: value for key, value in self.action_instance_memory.items() if key in referenced_actions
         }
@@ -200,8 +207,58 @@ class ShortMemory:
         action_label = "action" if action_type is None else f"action{int(action_type)}"
         return f"{action_label}@t{int(time_position)}:p{int(pair_index)}:{self._insert_counter}"
 
-    def store_noun_instance(self, instance_id: str, noun_embedding: torch.Tensor) -> None:
+    def store_noun_instance(self, instance_id: str, noun_embedding: torch.Tensor, noun_text: Optional[str] = None) -> None:
         self.noun_instance_memory[instance_id] = noun_embedding.to(self.device).view(-1).detach().clone()
+        self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text)
+
+    def _default_instance_metadata(self, noun_text: Optional[str]) -> Dict[str, Any]:
+        noun_key = None if noun_text is None else noun_text.lower()
+        return {
+            "noun_text": noun_key,
+            "entity_kind": default_entity_kind(noun_key),
+            "gender": default_gender(noun_key),
+            "owner_instance_id": None,
+            "owner_role": None,
+        }
+
+    def ensure_noun_instance_metadata(self, instance_id: str, noun_text: Optional[str] = None) -> Dict[str, Any]:
+        existing = self.noun_instance_metadata.get(instance_id)
+        if existing is None:
+            existing = self._default_instance_metadata(noun_text)
+            self.noun_instance_metadata[instance_id] = dict(existing)
+        elif noun_text is not None and not existing.get("noun_text"):
+            existing["noun_text"] = noun_text.lower()
+        return dict(self.noun_instance_metadata[instance_id])
+
+    def get_noun_instance_metadata(self, instance_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if instance_id is None:
+            return None
+        metadata = self.noun_instance_metadata.get(instance_id)
+        return None if metadata is None else dict(metadata)
+
+    def update_noun_instance_metadata(
+        self,
+        instance_id: str,
+        *,
+        noun_text: Optional[str] = None,
+        entity_kind: Optional[str] = None,
+        gender: Optional[str] = None,
+        owner_instance_id: Optional[str] = None,
+        owner_role: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        metadata = self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text)
+        if noun_text is not None:
+            metadata["noun_text"] = noun_text.lower()
+        if entity_kind is not None:
+            metadata["entity_kind"] = entity_kind
+        if gender is not None:
+            metadata["gender"] = gender
+        if owner_instance_id is not None:
+            metadata["owner_instance_id"] = owner_instance_id
+        if owner_role is not None:
+            metadata["owner_role"] = owner_role
+        self.noun_instance_metadata[instance_id] = dict(metadata)
+        return dict(metadata)
 
     def store_action_instance(self, instance_id: str, action_embedding: torch.Tensor) -> None:
         self.action_instance_memory[instance_id] = action_embedding.to(self.device).view(-1).detach().clone()
@@ -297,7 +354,7 @@ class ShortMemory:
         noun_key = noun_text.lower()
         noun_idx = rm._ensure_noun(noun_key) if noun_type is None else int(noun_type)
         noun_embedding = kt.knowledge_map_one.embedding.weight.detach()[noun_idx].clone()
-        self.store_noun_instance(instance_id, noun_embedding)
+        self.store_noun_instance(instance_id, noun_embedding, noun_text=noun_text)
         return noun_idx, noun_embedding.detach().clone(), instance_id
 
     def _relation_loss_for_entry(
@@ -384,7 +441,8 @@ class ShortMemory:
             adjusted_noun_embedding = noun_embedding - lr * noun_embedding.grad
 
         noun_embedding.grad.zero_()
-        self.store_noun_instance(resolved_instance_id, adjusted_noun_embedding.detach())
+        source_text = source_entry.source_text if source_entry is not None else None
+        self.store_noun_instance(resolved_instance_id, adjusted_noun_embedding.detach(), noun_text=source_text)
         return adjusted_noun_embedding.detach().clone()
 
     def rebuild_relation_clone(
@@ -556,7 +614,7 @@ class ShortMemory:
         noun_embedding = noun_embedding.to(self.device).view(-1)
         action_embedding = action_embedding.to(self.device).view(-1)
         self._resolve_state_dim(noun_embedding, action_embedding)
-        self.store_noun_instance(noun_instance_id, noun_embedding)
+        self.store_noun_instance(noun_instance_id, noun_embedding, noun_text=noun_text)
         self.store_action_instance(action_instance_id, action_embedding)
 
         base_info_pair = {
@@ -819,6 +877,8 @@ class ShortMemory:
                 "action_instance_id": entry.action_instance_id,
                 "noun_type": entry.noun_type,
                 "action_type": entry.action_type,
+                "noun_text": entry.noun_text,
+                "action_text": entry.action_text,
                 "time_position": entry.time_position,
                 "pair_index": entry.pair_index,
                 "score": entry.score,
@@ -838,6 +898,8 @@ class ShortMemory:
             {
                 "pair_kind": entry.relation_kind,
                 "relation_name": entry.relation_name,
+                "source_text": entry.source_text,
+                "target_text": entry.target_text,
                 "source_instance_id": entry.source_instance_id,
                 "target_instance_id": entry.target_instance_id,
                 "source_type": entry.source_type,
@@ -882,6 +944,7 @@ class ShortMemory:
         self.event_entries.clear()
         self.relation_entries.clear()
         self.noun_instance_memory.clear()
+        self.noun_instance_metadata.clear()
         self.action_instance_memory.clear()
         self.noun_relation_memory.clear()
         self.adj_relation_memory.clear()
@@ -889,3 +952,6 @@ class ShortMemory:
 
 ScoredTensorQueue = ShortMemory
 short_memory = ShortMemory(maxlen=50, device="cpu")
+
+
+

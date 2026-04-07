@@ -14,10 +14,10 @@ def relation_type_to_index(relation_type: int, relation_count: int) -> int:
 
 def iter_active_relations(matrix, relation_count: int) -> Iterator[Tuple[int, ...]]:
     for raw_indices in zip(*matrix.nonzero()):
-        *item_indices, raw_relation_type = raw_indices
-        relation_type = int(raw_relation_type)
+        item_indices = tuple(int(i) for i in raw_indices)
+        relation_type = int(matrix[item_indices])
         if 1 <= relation_type <= relation_count:
-            yield (*[int(i) for i in item_indices], relation_type)
+            yield (*item_indices, relation_type)
 
 
 def scale_row_gradients(grad: torch.Tensor | None, learning_rates: Sequence[float]) -> None:
@@ -46,3 +46,4 @@ def decay_learning_rates(
 ) -> None:
     for idx in sorted({int(index) for index in indices}):
         learning_rates[idx] = max(float(learning_rates[idx]) * decay, min_lr)
+

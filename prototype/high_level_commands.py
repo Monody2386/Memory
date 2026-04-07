@@ -13,6 +13,55 @@ class HighLevelCommands:
 
     consciousness: Consciousness = field(default_factory=Consciousness)
 
+    def _write_supervised_facts_from_sentence(
+        self,
+        sentence: str,
+        *,
+        relation_name_override: Optional[str] = None,
+        relation_token_override: Optional[str] = None,
+        save: bool = True,
+    ):
+        parsed = parse_sentence(sentence, short_memory=self.consciousness.short_memory)
+        writes = []
+
+        for relation_tuple in parsed.relation_tuples:
+            relation_label = relation_tuple.relation
+            if relation_name_override and relation_token_override and relation_label == relation_token_override:
+                relation_label = relation_name_override
+
+            relation_type = self.consciousness.resolve_relation_type(relation_tuple.kind, relation_label)
+            if relation_type is None:
+                continue
+
+            if relation_tuple.kind == "noun_noun_relation":
+                writes.append(
+                    self.consciousness.remember_noun_relation(
+                        relation_tuple.source,
+                        relation_tuple.target,
+                        relation_type,
+                        save=save,
+                    )
+                )
+            elif relation_tuple.kind == "adj_noun_relation":
+                writes.append(
+                    self.consciousness.remember_adj_relation(
+                        relation_tuple.source,
+                        relation_tuple.target,
+                        relation_type,
+                        save=save,
+                    )
+                )
+
+        for action_tuple in parsed.action_tuples:
+            writes.append(
+                self.consciousness.remember_noun_action(
+                    action_tuple.noun,
+                    action_tuple.action,
+                    save=save,
+                )
+            )
+
+        return writes
     def understand(
         self,
         sentence: str,
@@ -165,8 +214,7 @@ class HighLevelCommands:
         return {
             "command": "focus_instance",
             "instance_id": instance_id,
-            "target_score": float(target_score),
-            "epochs": int(epochs),
+            "target_score": float(target_score),
             "event_count": result["event_count"],
             "relation_count": result["relation_count"],
             "focus": result["focus"],
@@ -200,4 +248,334 @@ class HighLevelCommands:
         }
 
 
+    def question(self, *, order_by: str = "time"):
+        """Scan current short memory and ask about entries that disagree with long-term memory.
+
+        Input:
+            order_by: time or attention ordering used when scanning short memory.
+        Output:
+            dict: question summary containing relation/action mismatches found in memory.
+        """
+        relation_entries = self.consciousness.inspect_memory(kind="relation", order_by=order_by)
+        event_entries = self.consciousness.inspect_memory(kind="event", order_by=order_by)
+
+        questions = []
+        seen_keys = set()
+
+        for entry in relation_entries:
+            relation_kind = entry["pair_kind"]
+            relation_name = entry["relation_name"]
+            source_text = entry.get("source_text")
+            target_text = entry.get("target_text")
+
+            if not source_text or not target_text:
+                continue
+
+            relation_type = self.consciousness.resolve_relation_type(relation_kind, relation_name)
+            if relation_type is None:
+                continue
+
+            stored_value = self.consciousness.recall_relation_value(
+                relation_kind,
+                source_text,
+                target_text,
+            )
+            if stored_value != 0:
+                continue
+
+            key = (relation_kind, source_text, relation_name, target_text)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            questions.append(
+                {
+                    "kind": relation_kind,
+                    "prompt": f"I observed '{source_text}' with relation '{relation_name}' -> '{target_text}' in short memory, and long-term memory does not store this relation yet. Is this relation correct?",
+                    "source_noun": source_text,
+                    "target": target_text,
+                    "relation_name": relation_name,
+                    "relation_type": relation_type,
+                    "existing_memory": [],
+                    "memory_entry": entry,
+                }
+            )
+
+        for entry in event_entries:
+            noun_text = entry.get("noun_text")
+            action_text = entry.get("action_text")
+            if not noun_text or not action_text:
+                continue
+            recall = self.consciousness.recall_noun_action(noun=noun_text, action=action_text)
+            stored_value = 0 if not recall else int(recall[0]["value"])
+            if stored_value != 0:
+                continue
+            key = ("noun_action_relation", noun_text, action_text)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            questions.append(
+                {
+                    "kind": "noun_action_relation",
+                    "prompt": f"I observed the event '{noun_text} -> {action_text}' in short memory, and long-term memory does not store this noun-action relation yet. Should it be remembered?",
+                    "source_noun": noun_text,
+                    "target": action_text,
+                    "relation_name": "noun_action",
+                    "relation_type": None,
+                    "existing_memory": [],
+                    "memory_entry": entry,
+                }
+            )
+
+        return {
+            "command": "question",
+            "order_by": order_by,
+            "question_count": len(questions),
+            "questions": questions,
+        }
+
+
+    def answer_memory_question(
+        self,
+        question: dict,
+        answer_text: str,
+        *,
+        save: bool = True,
+    ):
+        """Apply a supervised y/n answer to one memory-derived question.
+
+        Input:
+            question: one question item returned by question().
+            answer_text: yes/y or no/n.
+            save: whether to persist approved long-term map updates.
+        Output:
+            dict: answer summary plus optional long-term write result.
+        """
+        normalized_answer = str(answer_text).strip().lower()
+        if normalized_answer not in {"y", "yes", "n", "no"}:
+            raise ValueError("answer_text must be one of: y, yes, n, no")
+
+        accepted = normalized_answer in {"y", "yes"}
+        if not accepted:
+            return {
+                "command": "answer_memory_question",
+                "accepted": False,
+                "written": False,
+                "kind": question.get("kind"),
+                "question": question,
+                "result": None,
+            }
+
+        kind = question.get("kind")
+        if kind == "noun_noun_relation":
+            result = self.consciousness.remember_noun_relation(
+                question["source_noun"],
+                question["target"],
+                int(question["relation_type"]),
+                save=save,
+            )
+        elif kind == "adj_noun_relation":
+            result = self.consciousness.remember_adj_relation(
+                question["source_noun"],
+                question["target"],
+                int(question["relation_type"]),
+                save=save,
+            )
+        elif kind == "noun_action_relation":
+            result = self.consciousness.remember_noun_action(
+                question["source_noun"],
+                question["target"],
+                save=save,
+            )
+        else:
+            raise ValueError("Unsupported memory question kind")
+
+        return {
+            "command": "answer_memory_question",
+            "accepted": True,
+            "written": True,
+            "kind": kind,
+            "question": question,
+            "result": result,
+        }
+
+    def sleep(self, *, save: bool = True):
+        """Clear short memory and run one joint-average consolidation step on long-term knowledge.
+
+        Input:
+            save: whether to persist the post-training long-term state.
+        Output:
+            dict: short-memory cleanup summary and joint-training summary.
+        """
+        cleared = self.consciousness.clear_short_memory()
+        training = self.consciousness.train_joint_knowledge(save=save)
+        return {
+            "command": "sleep",
+            "cleared_memory": cleared,
+            "joint_training": training,
+        }
+
+    def question_what(
+        self,
+        sentence: str,
+        *,
+        time_position: Optional[int] = None,
+        base_score: float = 1.0,
+        adjective_relation_types: Optional[Any] = None,
+    ):
+        """Gate sentence understanding by first checking whether the sentence contains unknown words.
+
+        Input:
+            sentence: raw sentence text.
+            time_position: optional explicit time step if the sentence can be understood directly.
+            base_score: initial attention score used by understand().
+            adjective_relation_types: optional adjective->relation mapping for grammar.
+        Output:
+            dict: either a list of what-questions or a direct understand() result when no unknown words remain.
+        """
+        grammar = self.consciousness._grammar()
+        tokens = grammar.tokenize_sentence(sentence)
+        questions = []
+        for position, token in enumerate(tokens):
+            result = self.consciousness.what(token, position=position, tokens=tokens)
+            if result.status == "known":
+                continue
+            questions.append(
+                {
+                    "kind": "what",
+                    "sentence": sentence,
+                    "word": token,
+                    "position": int(position),
+                    "predicted_pos": result.predicted_pos,
+                    "prompt": result.prompt,
+                    "candidates": list(result.candidates),
+                    "source": result.source,
+                    "context_tokens": list(tokens),
+                }
+            )
+
+        if questions:
+            return {
+                "command": "question_what",
+                "status": "question",
+                "sentence": sentence,
+                "unknown_count": len(questions),
+                "questions": questions,
+            }
+
+        understand_result = self.understand(
+            sentence,
+            time_position=time_position,
+            base_score=base_score,
+            adjective_relation_types=adjective_relation_types,
+        )
+        return {
+            "command": "question_what",
+            "status": "understood",
+            "sentence": sentence,
+            "unknown_count": 0,
+            "questions": [],
+            "understand_result": understand_result,
+        }
+
+    def answer_what(
+        self,
+        question: dict,
+        answer_info: dict,
+        *,
+        save: bool = True,
+        re_understand: bool = True,
+        write_facts: bool = True,
+        base_score: float = 1.0,
+    ):
+        """Apply a user-provided answer to one unknown-word question and optionally re-understand the sentence.
+
+        Input:
+            question: one question item returned by question_what().
+            answer_info: dict containing at least pos, and optionally relation_name/relation_family.
+            save: whether to persist vocabulary updates.
+            re_understand: whether to re-run understand(sentence) after registration.
+            write_facts: whether supervised facts from the answered sentence should be written directly.
+            base_score: memory score used if re-understanding is requested.
+        Output:
+            dict: registration summary plus optional understanding result.
+        """
+        token = str(question["word"]).lower()
+        sentence = question.get("sentence")
+        pos = str(answer_info["pos"]).strip().lower()
+        relation_name = answer_info.get("relation_name")
+        relation_family = answer_info.get("relation_family")
+
+        updates = []
+        updates.append(self.consciousness.register_token_pos(token, pos, save=save))
+
+        if pos == "adj" and relation_name:
+            updates.append(
+                self.consciousness.register_adjective_relation_hint(
+                    token,
+                    str(relation_name).lower(),
+                    save=save,
+                )
+            )
+        elif pos == "relation":
+            updates.append(
+                self.consciousness.register_relation_name(
+                    relation_name or token,
+                    relation_family=(relation_family or "noun_noun_relation"),
+                    save=save,
+                )
+            )
+
+        fact_writes = []
+        if write_facts and sentence:
+            if pos == "adj" and relation_name:
+                grammar = self.consciousness._grammar()
+                tokens = grammar.tokenize_sentence(sentence)
+                relation_type = self.consciousness.resolve_relation_type(
+                    "adj_noun_relation",
+                    str(relation_name).lower(),
+                )
+                if relation_type is not None:
+                    for candidate in tokens:
+                        if candidate == token:
+                            continue
+                        fact_writes.append(
+                            self.consciousness.remember_adj_relation(
+                                candidate,
+                                token,
+                                relation_type,
+                                save=save,
+                            )
+                        )
+            else:
+                fact_writes = self._write_supervised_facts_from_sentence(
+                    sentence,
+                    relation_name_override=(None if relation_name is None else str(relation_name).lower()),
+                    relation_token_override=(token if pos == "relation" else None),
+                    save=save,
+                )
+
+        re_understand_result = None
+        if re_understand and sentence:
+            re_understand_result = self.understand(sentence, base_score=base_score)
+
+        return {
+            "command": "answer_what",
+            "question": question,
+            "answer_info": dict(answer_info),
+            "updates": updates,
+            "fact_writes": fact_writes,
+            "re_understand": re_understand_result,
+        }
 __all__ = ["HighLevelCommands"]
+
+
+
+
+
+
+
+
+
+
+
+
