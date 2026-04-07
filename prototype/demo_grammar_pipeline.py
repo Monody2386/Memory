@@ -12,7 +12,6 @@ def _print_section(title: str):
     print()
     print(title)
 
-
 def main():
     cmd = HighLevelCommands()
 
