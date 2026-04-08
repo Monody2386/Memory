@@ -1,7 +1,7 @@
 from typing import Iterable, List
 
 NO_ACTION_NAME = "no_action"
-DEFAULT_ACTION_LIST = ["action1", "action2", "action3"]
+DEFAULT_ACTION_LIST = ["action1", "action2", "action3", "eat"]
 action_list = list(DEFAULT_ACTION_LIST)
 
 

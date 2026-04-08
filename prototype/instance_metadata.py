@@ -8,8 +8,17 @@ PRONOUN_LIST = {
 
 POSSESSIVE_LIST = {
     "my", "your", "his", "her", "its", "our", "their",
+}
+
+POSSESSIVE_NOUN_LIST = {
     "mine", "yours", "hers", "ours", "theirs",
 }
+
+INSTANCE_SCOPE_WORLD = "world"
+INSTANCE_SCOPE_SCENE = "scene"
+VALID_INSTANCE_SCOPES = {INSTANCE_SCOPE_WORLD, INSTANCE_SCOPE_SCENE}
+
+PERSON_NAME_LIST = {"tom", "mary", "john", "anna"}
 
 DEFAULT_ENTITY_KIND_BY_NOUN = {
     # people
@@ -84,3 +93,17 @@ def pronoun_filters(pronoun: str) -> Tuple[Optional[str], Optional[str]]:
 
 def possessive_owner_role(word: str) -> Optional[str]:
     return POSSESSIVE_OWNER_ROLE_MAP.get(word.lower())
+
+def normalize_instance_scope(instance_scope: Optional[str]) -> str:
+    if instance_scope is None:
+        return INSTANCE_SCOPE_SCENE
+    scope = instance_scope.lower()
+    if scope not in VALID_INSTANCE_SCOPES:
+        raise ValueError(f"instance_scope must be one of: {sorted(VALID_INSTANCE_SCOPES)}")
+    return scope
+
+def is_named_person_noun(noun_text: Optional[str]) -> bool:
+    if noun_text is None:
+        return False
+    return noun_text.lower() in PERSON_NAME_LIST
+

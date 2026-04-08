@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
-from prototype.instance_metadata import default_entity_kind, default_gender
+from prototype.instance_metadata import default_entity_kind, default_gender, normalize_instance_scope
 
 import torch
 import torch.nn.functional as F
@@ -207,11 +207,17 @@ class ShortMemory:
         action_label = "action" if action_type is None else f"action{int(action_type)}"
         return f"{action_label}@t{int(time_position)}:p{int(pair_index)}:{self._insert_counter}"
 
-    def store_noun_instance(self, instance_id: str, noun_embedding: torch.Tensor, noun_text: Optional[str] = None) -> None:
+    def store_noun_instance(
+        self,
+        instance_id: str,
+        noun_embedding: torch.Tensor,
+        noun_text: Optional[str] = None,
+        instance_scope: Optional[str] = None,
+    ) -> None:
         self.noun_instance_memory[instance_id] = noun_embedding.to(self.device).view(-1).detach().clone()
-        self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text)
+        self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
 
-    def _default_instance_metadata(self, noun_text: Optional[str]) -> Dict[str, Any]:
+    def _default_instance_metadata(self, noun_text: Optional[str], instance_scope: Optional[str] = None) -> Dict[str, Any]:
         noun_key = None if noun_text is None else noun_text.lower()
         return {
             "noun_text": noun_key,
@@ -219,15 +225,25 @@ class ShortMemory:
             "gender": default_gender(noun_key),
             "owner_instance_id": None,
             "owner_role": None,
+            "instance_scope": normalize_instance_scope(instance_scope),
         }
 
-    def ensure_noun_instance_metadata(self, instance_id: str, noun_text: Optional[str] = None) -> Dict[str, Any]:
+    def ensure_noun_instance_metadata(
+        self,
+        instance_id: str,
+        noun_text: Optional[str] = None,
+        instance_scope: Optional[str] = None,
+    ) -> Dict[str, Any]:
         existing = self.noun_instance_metadata.get(instance_id)
         if existing is None:
-            existing = self._default_instance_metadata(noun_text)
+            existing = self._default_instance_metadata(noun_text, instance_scope=instance_scope)
             self.noun_instance_metadata[instance_id] = dict(existing)
-        elif noun_text is not None and not existing.get("noun_text"):
-            existing["noun_text"] = noun_text.lower()
+        else:
+            if noun_text is not None and not existing.get("noun_text"):
+                existing["noun_text"] = noun_text.lower()
+            if instance_scope is not None and not existing.get("instance_scope"):
+                existing["instance_scope"] = normalize_instance_scope(instance_scope)
+            self.noun_instance_metadata[instance_id] = dict(existing)
         return dict(self.noun_instance_metadata[instance_id])
 
     def get_noun_instance_metadata(self, instance_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -245,8 +261,10 @@ class ShortMemory:
         gender: Optional[str] = None,
         owner_instance_id: Optional[str] = None,
         owner_role: Optional[str] = None,
+        instance_scope: Optional[str] = None,
+        extra_attributes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        metadata = self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text)
+        metadata = self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
         if noun_text is not None:
             metadata["noun_text"] = noun_text.lower()
         if entity_kind is not None:
@@ -257,6 +275,10 @@ class ShortMemory:
             metadata["owner_instance_id"] = owner_instance_id
         if owner_role is not None:
             metadata["owner_role"] = owner_role
+        if instance_scope is not None:
+            metadata["instance_scope"] = normalize_instance_scope(instance_scope)
+        if extra_attributes:
+            metadata.update(dict(extra_attributes))
         self.noun_instance_metadata[instance_id] = dict(metadata)
         return dict(metadata)
 
@@ -340,10 +362,12 @@ class ShortMemory:
         noun_text: str,
         instance_id: Optional[str],
         noun_type: Optional[int] = None,
+        instance_scope: Optional[str] = None,
     ):
         instance_id = instance_id or self._default_noun_instance_id(noun_type)
         existing_embedding = self.get_noun_embedding(instance_id)
         if existing_embedding is not None:
+            self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
             resolved_type = noun_type
             if resolved_type is None:
                 rm, _, _ = self._load_language_context()
@@ -354,7 +378,7 @@ class ShortMemory:
         noun_key = noun_text.lower()
         noun_idx = rm._ensure_noun(noun_key) if noun_type is None else int(noun_type)
         noun_embedding = kt.knowledge_map_one.embedding.weight.detach()[noun_idx].clone()
-        self.store_noun_instance(instance_id, noun_embedding, noun_text=noun_text)
+        self.store_noun_instance(instance_id, noun_embedding, noun_text=noun_text, instance_scope=instance_scope)
         return noun_idx, noun_embedding.detach().clone(), instance_id
 
     def _relation_loss_for_entry(

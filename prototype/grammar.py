@@ -25,7 +25,8 @@ import torch
 import torch.nn.functional as F
 
 from world.action_vocab import ensure_action
-from prototype.instance_metadata import PRONOUN_LIST, POSSESSIVE_LIST, possessive_owner_role, pronoun_filters
+from prototype.instance_metadata import PRONOUN_LIST, POSSESSIVE_LIST, POSSESSIVE_NOUN_LIST, possessive_owner_role, pronoun_filters, is_named_person_noun
+from prototype.grammar_routes import DEFAULT_EXTRACTOR_ROUTES
 
 
 @dataclass
@@ -67,6 +68,15 @@ class RelationTuple:
 
 
 @dataclass
+class InstanceAttributeUpdate:
+    instance_id: str
+    attribute_name: str
+    attribute_value: str
+    noun_text: Optional[str] = None
+    source_tokens: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ParsedSentence:
     sentence: str
     tokens: List[str]
@@ -76,6 +86,7 @@ class ParsedSentence:
     sentence_type: str = "unknown_sentence"
     action_tuples: List[ActionTuple] = field(default_factory=list)
     relation_tuples: List[RelationTuple] = field(default_factory=list)
+    instance_updates: List[InstanceAttributeUpdate] = field(default_factory=list)
 
 
 @dataclass
@@ -172,6 +183,14 @@ ADJECTIVE_RELATION_HINTS = {
 
 WORD_RE = re.compile(r"[A-Za-z']+")
 RelationOverride = Union[int, str]
+STANDALONE_POSSESSIVE_EXPANSIONS = {
+    "mine": "my",
+    "yours": "your",
+    "hers": "her",
+    "ours": "our",
+    "theirs": "their",
+}
+BE_VERB_SET = {"am", "is", "are", "was", "were", "be", "been", "being"}
 
 
 # ===========================================================================
@@ -184,7 +203,12 @@ def split_event(event_tokens):
     return tuple(event_tokens)
 
 
-def tokenize_sentence(sentence: str) -> List[str]:
+def tokenize_sentence(
+    sentence: str,
+    instance_context=None,
+    short_memory=None,
+) -> List[str]:
+    del instance_context, short_memory
     tokens = WORD_RE.findall(sentence)
     if not tokens:
         raise ValueError("sentence does not contain any word tokens")
@@ -307,7 +331,9 @@ def _build_pos_lexicons():
         "adjectives": set(arm.adjective_list) | set(ADJECTIVE_RELATION_HINTS.keys()),
         "pronouns": set(PRONOUN_LIST),
         "possessives": set(POSSESSIVE_LIST),
+        "possessive_nouns": set(POSSESSIVE_NOUN_LIST),
         "actions": {action.lower() for action in action_vocab.action_list},
+        "be_verbs": set(BE_VERB_SET),
         "relations": [relation.lower() for relation in rm.relation_list],
         "relation_tokens": relation_tokens,
     }
@@ -334,12 +360,17 @@ def _coerce_instance_context(instance_context=None, short_memory=None):
     return build_instance_context_from_memory(short_memory)
 
 
+
 def tag_tokens(
     sentence: str,
     instance_context=None,
     short_memory=None,
 ) -> List[TaggedToken]:
-    tokens = tokenize_sentence(sentence)
+    tokens = tokenize_sentence(
+        sentence,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
     lexicons = _build_pos_lexicons()
     relation_match = _resolve_relation_phrase(tokens, lexicons["relations"])
     relation_span = set(range(relation_match[1], relation_match[2])) if relation_match else set()
@@ -350,8 +381,14 @@ def tag_tokens(
         if index in relation_span:
             tagged_tokens.append(TaggedToken(text=token, pos="relation", index=index, source="relation_phrase"))
             continue
+        if token in lexicons["possessive_nouns"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="possessive_noun", index=index, source="possessive_noun_list", entity_text=token))
+            continue
         if token in lexicons["possessives"]:
             tagged_tokens.append(TaggedToken(text=token, pos="possessive", index=index, source="possessive_list", entity_text=token))
+            continue
+        if token in lexicons["be_verbs"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="be", index=index, source="be_verb_list", entity_text=token))
             continue
         if token in lexicons["pronouns"]:
             tagged_tokens.append(TaggedToken(text=token, pos="pronoun", index=index, source="pronoun_list", entity_text=token))
@@ -426,6 +463,9 @@ def build_instance_context_from_memory(short_memory) -> Dict[str, object]:
             "score": float(score),
             "entity_kind": "unknown" if metadata is None else metadata.get("entity_kind", "unknown"),
             "gender": "unknown" if metadata is None else metadata.get("gender", "unknown"),
+            "owner_instance_id": None if metadata is None else metadata.get("owner_instance_id"),
+            "owner_role": None if metadata is None else metadata.get("owner_role"),
+            "instance_scope": "scene" if metadata is None else metadata.get("instance_scope", "scene"),
         }
         if current is None or (candidate["time_position"], candidate["pair_index"]) >= (current["time_position"], current["pair_index"]):
             context["by_instance"][instance_id] = candidate
@@ -436,6 +476,14 @@ def build_instance_context_from_memory(short_memory) -> Dict[str, object]:
     for entry in getattr(short_memory, "short_memory_relation", []):
         register(entry.source_text, entry.source_instance_id, entry.time_position, entry.pair_index, getattr(entry, "score", 0.0))
         register(entry.target_text, entry.target_instance_id, entry.time_position, entry.pair_index, getattr(entry, "score", 0.0))
+
+    for instance_id, metadata in getattr(short_memory, "noun_instance_metadata", {}).items():
+        if instance_id in context["by_instance"]:
+            continue
+        noun_text = metadata.get("noun_text")
+        if noun_text is None:
+            continue
+        register(noun_text, instance_id, -1, -1, 0.0)
 
     for noun_key, bucket in context["by_noun"].items():
         bucket.sort(key=lambda item: (item[0], item[1]))
@@ -523,6 +571,24 @@ def _select_instance_for_pronoun(pronoun: str, instance_context) -> Optional[str
     return None if item is None else str(item["instance_id"])
 
 
+def _resolve_existing_possessive_instance_id(
+    noun_text: str,
+    owner_instance_id: Optional[str],
+    owner_role: Optional[str],
+    instance_context,
+) -> Optional[str]:
+    if not instance_context:
+        return None
+
+    candidates = instance_context.get("by_noun", {}).get(noun_text.lower(), [])
+    by_instance = instance_context.get("by_instance", {})
+    for candidate_instance_id in reversed(candidates):
+        metadata = by_instance.get(candidate_instance_id, {})
+        if metadata.get("owner_instance_id") == owner_instance_id and metadata.get("owner_role") == owner_role:
+            return candidate_instance_id
+    return None
+
+
 def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
     has_action = bool(parsed.action_tuples)
     has_noun_relation = any(
@@ -531,6 +597,7 @@ def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
     has_adj_relation = any(
         relation_tuple.kind == "adj_noun_relation" for relation_tuple in parsed.relation_tuples
     )
+    has_instance_update = bool(parsed.instance_updates)
 
     if has_action and has_noun_relation:
         return "mixed_sentence"
@@ -540,6 +607,8 @@ def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
         return "relation_sentence"
     if has_adj_relation:
         return "attribute_sentence"
+    if has_instance_update:
+        return "instance_update_sentence"
     return "unknown_sentence"
 
 
@@ -608,6 +677,55 @@ def _resolve_owner_for_possessive(word: str, instance_context) -> Tuple[Optional
     return None, role
 
 
+def _expand_possessive_noun_tokens(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    instance_context=None,
+    short_memory=None,
+) -> Tuple[List[str], List[TaggedToken]]:
+    resolved_context = _coerce_instance_context(
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    focus_noun_text = None if not resolved_context else resolved_context.get("focus_noun_text")
+    if not focus_noun_text:
+        return list(tokens), list(tagged_tokens)
+
+    expanded_tokens: List[str] = []
+    expanded_tags: List[TaggedToken] = []
+    for tag in tagged_tokens:
+        token_text = tag.text
+        if tag.pos == "possessive_noun":
+            replacement = STANDALONE_POSSESSIVE_EXPANSIONS.get(token_text.lower())
+            if replacement is not None:
+                expanded_tokens.append(replacement)
+                expanded_tags.append(
+                    TaggedToken(
+                        text=replacement,
+                        pos="possessive",
+                        index=tag.index,
+                        source="expansion_possessive_noun",
+                        question_prompt=tag.question_prompt,
+                        entity_text=replacement,
+                    )
+                )
+                expanded_tokens.append(str(focus_noun_text))
+                expanded_tags.append(
+                    TaggedToken(
+                        text=str(focus_noun_text),
+                        pos="noun",
+                        index=tag.index,
+                        source="expansion_possessive_noun_focus",
+                        entity_text=str(focus_noun_text),
+                    )
+                )
+                continue
+        expanded_tokens.append(token_text)
+        expanded_tags.append(tag)
+    return expanded_tokens, expanded_tags
+
+
 def _reduce_possessive_noun_phrases(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
@@ -633,14 +751,21 @@ def _reduce_possessive_noun_phrases(
             possessive_word = tokens[index]
             head_tag = tagged_tokens[index + 1]
             head_noun = _token_entity_text(tokens[index + 1], head_tag)
-            noun_instance_id = head_tag.instance_id or _resolve_existing_instance_id(
-                head_noun,
-                resolved_context,
-                {},
-            )
-            if noun_instance_id is None:
-                noun_instance_id = _build_instance_id(head_noun, create_counters)
             owner_instance_id, owner_role = _resolve_owner_for_possessive(possessive_word, resolved_context)
+            noun_instance_id = head_tag.instance_id
+            if noun_instance_id is None:
+                noun_instance_id = _resolve_existing_possessive_instance_id(
+                    head_noun,
+                    owner_instance_id,
+                    owner_role,
+                    resolved_context,
+                )
+            if noun_instance_id is None:
+                noun_instance_id = _build_instance_id(
+                    head_noun,
+                    create_counters,
+                    instance_context=resolved_context,
+                )
             reduced_tokens.append(noun_instance_id)
             reduced_tags.append(
                 TaggedToken(
@@ -700,7 +825,7 @@ def _reduce_pronoun_noun_phrases(
                     {},
                 ) or noun_instance_id
                 if noun_instance_id is None:
-                    noun_instance_id = _build_instance_id(head_token, create_counters)
+                    noun_instance_id = _build_instance_id(head_token, create_counters, instance_context=resolved_context)
             else:
                 selected_item = _select_instance_record_for_pronoun(head_token, resolved_context)
                 if selected_item is not None:
@@ -708,7 +833,7 @@ def _reduce_pronoun_noun_phrases(
                     reduced_text = str(selected_item.get("noun_text") or head_token)
                     reduced_pos = "noun"
                 elif noun_instance_id is None:
-                    noun_instance_id = _build_instance_id(head_token, create_counters)
+                    noun_instance_id = _build_instance_id(head_token, create_counters, instance_context=resolved_context)
 
             reduced_surface = noun_instance_id if noun_instance_id is not None else reduced_text
             reduced_tokens.append(reduced_surface)
@@ -743,7 +868,7 @@ def _reduce_pronoun_noun_phrases(
                 )
                 current_token = current_tag.text
             elif current_tag.instance_id is None:
-                new_instance_id = _build_instance_id(current_tag.text, create_counters)
+                new_instance_id = _build_instance_id(current_tag.text, create_counters, instance_context=resolved_context)
                 current_tag = TaggedToken(
                     text=new_instance_id,
                     pos="noun",
@@ -865,7 +990,10 @@ def _bind_existing_noun_instances(
 
         noun_instance_id = tag.instance_id
         if noun_instance_id is None:
-            noun_instance_id = _resolve_existing_instance_id(token, resolved_context, {})
+            noun_key = _token_entity_text(token, tag)
+            noun_instance_id = _resolve_existing_instance_id(noun_key, resolved_context, {})
+            if noun_instance_id is None and is_named_person_noun(noun_key):
+                noun_instance_id = _build_instance_id(noun_key, {}, instance_context=resolved_context)
         bound_surface = noun_instance_id if noun_instance_id is not None else tag.text
         bound_tokens[len(bound_tags)] = bound_surface
         bound_tags.append(
@@ -904,14 +1032,121 @@ def _parse_noun_phrase(tokens: Sequence[str], tags: Sequence[TaggedToken]) -> Tu
     return noun, adjectives, noun_instance_id, owner_instance_id, owner_role
 
 
+def _has_noun_relation(source_noun: str, relation_name: str, target_noun: str) -> bool:
+    rm, _, _ = _load_language_context()
+    source_key = source_noun.lower()
+    target_key = target_noun.lower()
+    if relation_name not in rm.relation_list:
+        return False
+    if source_key not in rm.noun_list or target_key not in rm.noun_list:
+        return False
+    relation_type = rm.relation_list.index(relation_name) + 1
+    source_idx = rm.noun_list.index(source_key)
+    target_idx = rm.noun_list.index(target_key)
+    return int(rm.relation_map[source_idx, target_idx]) == relation_type
+
+
+def _lookup_belong_to_slot(noun: str) -> Optional[str]:
+    rm, _, _ = _load_language_context()
+    relation_name = "belong to"
+    if relation_name not in rm.relation_list:
+        return None
+    noun_key = noun.lower()
+    if noun_key not in rm.noun_list:
+        return None
+    relation_type = rm.relation_list.index(relation_name) + 1
+    noun_idx = rm.noun_list.index(noun_key)
+    for target_idx, stored_relation_type in enumerate(rm.relation_map[noun_idx]):
+        if int(stored_relation_type) == relation_type and target_idx < len(rm.noun_list):
+            return rm.noun_list[target_idx]
+    return None
+
+
+def _extract_pattern_be_noun(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing
+    if len(tokens) != 3:
+        raise ValueError("be_noun sentence requires noun + be + noun")
+
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="be_noun",
+        sentence_type="relation_sentence",
+    )
+
+    left_noun, _, left_instance_id, left_owner_instance_id, left_owner_role = _parse_noun_phrase([tokens[0]], [tagged_tokens[0]])
+    right_noun, _, right_instance_id, _, _ = _parse_noun_phrase([tokens[2]], [tagged_tokens[2]])
+
+    if left_instance_id is not None and left_owner_instance_id is not None:
+        include_match = _has_noun_relation(left_noun, "include", right_noun)
+        if include_match:
+            parsed.instance_updates.append(
+                InstanceAttributeUpdate(
+                    instance_id=left_owner_instance_id,
+                    attribute_name=left_noun,
+                    attribute_value=right_noun,
+                    noun_text=None,
+                    source_tokens=list(tokens),
+                )
+            )
+            parsed.sentence_type = "instance_update_sentence"
+            return parsed
+
+    if left_instance_id is not None and left_owner_instance_id is None and left_owner_role is None:
+        slot_name = _lookup_belong_to_slot(right_noun)
+        if slot_name is not None:
+            parsed.instance_updates.append(
+                InstanceAttributeUpdate(
+                    instance_id=left_instance_id,
+                    attribute_name=slot_name,
+                    attribute_value=right_noun,
+                    noun_text=left_noun,
+                    source_tokens=list(tokens),
+                )
+            )
+            parsed.sentence_type = "instance_update_sentence"
+            return parsed
+
+    if left_instance_id is None:
+        resolved_context = _coerce_instance_context(instance_context=instance_context, short_memory=short_memory)
+        left_instance_id = _build_instance_id(left_noun, {}, instance_context=resolved_context)
+
+    parsed.relation_tuples.append(
+        RelationTuple(
+            source=left_noun,
+            relation="belong to",
+            target=right_noun,
+            kind="noun_noun_relation",
+            source_instance_id=left_instance_id,
+            target_instance_id=right_instance_id,
+            owner_instance_id=left_owner_instance_id,
+            owner_role=left_owner_role,
+            source_tokens=list(tokens),
+        )
+    )
+    return parsed
+
+
 def _extract_pattern_action_with_object(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
     adjective_relation_types=None,
     infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
 ) -> ParsedSentence:
-    del adjective_relation_types, infer_missing
+    del adjective_relation_types, infer_missing, instance_context, short_memory
     parsed = ParsedSentence(
         sentence=" ".join(tokens),
         tokens=list(tokens),
@@ -958,14 +1193,78 @@ def _extract_pattern_action_with_object(
     return parsed
 
 
+def _extract_pattern_be_attribute(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del instance_context, short_memory
+    _, arm, _ = _load_language_context()
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="be_attribute",
+        sentence_type="attribute_sentence",
+    )
+
+    if len(tokens) < 3:
+        raise ValueError("be_attribute sentence requires at least noun + be + adj")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    subject_instance_id = tagged_tokens[0].instance_id
+    adjective_tokens = list(tokens[2:])
+    adjective_tags = list(tagged_tokens[2:])
+    if not adjective_tags or any(tag.pos != "adj" for tag in adjective_tags):
+        raise ValueError("be_attribute sentence requires adjective tokens after be")
+
+    relation_overrides = _resolve_adjective_relation_overrides(
+        adjective_tokens,
+        adjective_relation_types,
+        arm.adj_relation_list,
+    )
+    for adjective, relation_override in zip(adjective_tokens, relation_overrides):
+        relation_name = _resolve_adj_relation_name(
+            subject,
+            adjective,
+            relation_override,
+            infer_missing=infer_missing,
+            relation_names=arm.adj_relation_list,
+        )
+        if relation_name is None:
+            continue
+        parsed.relation_tuples.append(
+            RelationTuple(
+                source=subject,
+                relation=relation_name,
+                target=adjective,
+                kind="adj_noun_relation",
+                source_instance_id=subject_instance_id,
+                target_instance_id=None,
+                owner_instance_id=tagged_tokens[0].owner_instance_id,
+                owner_role=tagged_tokens[0].owner_role,
+                source_tokens=list(tokens),
+            )
+        )
+
+    return parsed
+
+
 def _extract_pattern_relation_between_noun_phrases(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
     adjective_relation_types=None,
     infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
 ) -> ParsedSentence:
-    del adjective_relation_types, infer_missing
+    del adjective_relation_types, infer_missing, instance_context, short_memory
     rm, _, _ = _load_language_context()
     relation_match = _resolve_relation_phrase(tokens, [relation.lower() for relation in rm.relation_list])
     if relation_match is None:
@@ -1026,14 +1325,49 @@ def _build_reduction_only_parse(
     return parsed
 
 
+def _structure_for_extractor_routing(tagged_tokens: Sequence[TaggedToken]) -> Tuple[str, ...]:
+    structure: List[str] = []
+    for tag in tagged_tokens:
+        pos = tag.pos
+        if pos == "relation" and structure and structure[-1] == "relation":
+            continue
+        structure.append(pos)
+    return tuple(structure)
+
+
+# Extractor routing is driven by structure signatures so new simple sentence
+# patterns can be added in prototype/grammar_routes.py without rewriting the
+# selection logic here.
+def _match_extractor_route(structure: Tuple[str, ...], route) -> bool:
+    route_structure = tuple(route.structure)
+    if route.match_mode == "exact":
+        return structure == route_structure
+    if route.match_mode == "prefix":
+        if len(structure) < len(route_structure):
+            return False
+        return structure[: len(route_structure)] == route_structure
+    raise ValueError(f"Unsupported extractor route match_mode: {route.match_mode}")
+
+
 def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken]):
-    rm, _, _ = _load_language_context()
-    relation_match = _resolve_relation_phrase(tokens, [relation.lower() for relation in rm.relation_list])
-    if relation_match is not None:
-        return _extract_pattern_relation_between_noun_phrases
-    if len(tokens) >= 2 and tagged_tokens[1].pos == "action":
-        return _extract_pattern_action_with_object
-    raise ValueError(f"No extraction strategy defined for structure {tuple(tag.pos for tag in tagged_tokens)}")
+    del tokens
+    structure = _structure_for_extractor_routing(tagged_tokens)
+    extractor_map = {
+        "_extract_pattern_be_attribute": _extract_pattern_be_attribute,
+        "_extract_pattern_be_noun": _extract_pattern_be_noun,
+        "_extract_pattern_action_with_object": _extract_pattern_action_with_object,
+        "_extract_pattern_relation_between_noun_phrases": _extract_pattern_relation_between_noun_phrases,
+    }
+
+    for route in DEFAULT_EXTRACTOR_ROUTES:
+        if not _match_extractor_route(structure, route):
+            continue
+        extractor = extractor_map.get(route.extractor_name)
+        if extractor is None:
+            raise ValueError(f"Unknown extractor registered for pattern {route.pattern_name}: {route.extractor_name}")
+        return extractor
+
+    raise ValueError(f"No extraction strategy defined for structure {structure}")
 
 
 def parse_sentence(
@@ -1047,16 +1381,26 @@ def parse_sentence(
     short_memory=None,
 ) -> ParsedSentence:
     del noun_relation_type  # grammar parses structure; routing decides how to use relation configs.
-    tokens = tokenize_sentence(sentence)
-    tagged_tokens = tag_tokens(
+    tokens = tokenize_sentence(
         sentence,
         instance_context=instance_context,
         short_memory=short_memory,
     )
+    tagged_tokens = tag_tokens(
+        " ".join(tokens),
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
 
-    reduced_tokens, reduced_tags, reduced_relations = _reduce_adj_noun_phrases(
+    reduced_tokens, reduced_tags = _expand_possessive_noun_tokens(
         tokens,
         tagged_tokens,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    reduced_tokens, reduced_tags, reduced_relations = _reduce_adj_noun_phrases(
+        reduced_tokens,
+        reduced_tags,
         adjective_relation_types=adjective_relation_types,
         infer_missing=infer_missing,
     )
@@ -1092,6 +1436,8 @@ def parse_sentence(
             reduced_tags,
             adjective_relation_types=adjective_relation_types,
             infer_missing=infer_missing,
+            instance_context=instance_context,
+            short_memory=short_memory,
         )
         parsed.relation_tuples = list(reduced_relations) + list(parsed.relation_tuples)
 
@@ -1109,10 +1455,23 @@ def parse_sentence(
 # ===========================================================================
 
 
-def _build_instance_id(noun_text: str, create_counters: Dict[str, int]) -> str:
+def _build_instance_id(
+    noun_text: str,
+    create_counters: Dict[str, int],
+    instance_context=None,
+) -> str:
     noun_key = noun_text.lower()
-    create_counters[noun_key] = int(create_counters.get(noun_key, 0)) + 1
-    return f"{noun_key}#new:{create_counters[noun_key]}"
+    existing_max = 0
+    if instance_context:
+        for instance_id in instance_context.get("by_noun", {}).get(noun_key, []):
+            prefix = f"{noun_key}#new:"
+            if instance_id.startswith(prefix):
+                suffix = instance_id[len(prefix):]
+                if suffix.isdigit():
+                    existing_max = max(existing_max, int(suffix))
+    next_counter = max(int(create_counters.get(noun_key, 0)), existing_max) + 1
+    create_counters[noun_key] = next_counter
+    return f"{noun_key}#new:{next_counter}"
 
 
 def _resolve_instance_candidate(
@@ -1134,13 +1493,15 @@ def _resolve_action_tuple_instance_id(
     sentence_assignments: Dict[str, str],
     create_counters: Dict[str, int],
 ) -> str:
-    candidate = _resolve_instance_candidate(
-        action_tuple.noun,
-        instance_context=instance_context,
-        sentence_assignments=sentence_assignments,
-    )
+    candidate = action_tuple.noun_instance_id
     if candidate is None:
-        candidate = _build_instance_id(action_tuple.noun, create_counters)
+        candidate = _resolve_instance_candidate(
+            action_tuple.noun,
+            instance_context=instance_context,
+            sentence_assignments=sentence_assignments,
+        )
+    if candidate is None:
+        candidate = _build_instance_id(action_tuple.noun, create_counters, instance_context=instance_context)
     sentence_assignments[action_tuple.noun.lower()] = candidate
     return candidate
 
@@ -1157,11 +1518,13 @@ def _resolve_relation_tuple_source_instance_id(
     if source_key in sentence_assignments:
         return sentence_assignments[source_key]
 
-    candidate = _resolve_instance_candidate(
-        relation_tuple.source,
-        instance_context=instance_context,
-        sentence_assignments=sentence_assignments,
-    )
+    candidate = relation_tuple.source_instance_id
+    if candidate is None:
+        candidate = _resolve_instance_candidate(
+            relation_tuple.source,
+            instance_context=instance_context,
+            sentence_assignments=sentence_assignments,
+        )
     if candidate is not None:
         sentence_assignments[source_key] = candidate
         return candidate
@@ -1182,11 +1545,13 @@ def _resolve_relation_tuple_target_instance_id(
     if target_key in sentence_assignments:
         return sentence_assignments[target_key]
 
-    candidate = _resolve_instance_candidate(
-        relation_tuple.target,
-        instance_context=instance_context,
-        sentence_assignments=sentence_assignments,
-    )
+    candidate = relation_tuple.target_instance_id
+    if candidate is None:
+        candidate = _resolve_instance_candidate(
+            relation_tuple.target,
+            instance_context=instance_context,
+            sentence_assignments=sentence_assignments,
+        )
     if candidate is not None:
         sentence_assignments[target_key] = candidate
     return candidate
@@ -1262,6 +1627,7 @@ def resolve_instances_for_parsed_sentence(
         sentence_type=parsed.sentence_type,
         action_tuples=resolved_actions,
         relation_tuples=resolved_relations,
+        instance_updates=list(parsed.instance_updates),
     )
 
 
@@ -1664,6 +2030,36 @@ def append_sentence_to_short_memory(
         time_position=resolved_time_position,
     )
 
+    for instance_update in parsed.instance_updates:
+        update_kwargs = {
+            "extra_attributes": {instance_update.attribute_name: instance_update.attribute_value},
+        }
+        if instance_update.noun_text is not None:
+            update_kwargs["noun_text"] = instance_update.noun_text
+        short_memory.update_noun_instance_metadata(
+            instance_update.instance_id,
+            **update_kwargs,
+        )
+
+    for relation_tuple in parsed.relation_tuples:
+        if relation_tuple.source_instance_id is not None and (
+            relation_tuple.owner_instance_id is not None or relation_tuple.owner_role is not None
+        ):
+            short_memory.update_noun_instance_metadata(
+                relation_tuple.source_instance_id,
+                noun_text=relation_tuple.source,
+                owner_instance_id=relation_tuple.owner_instance_id,
+                owner_role=relation_tuple.owner_role,
+            )
+        if relation_tuple.source_instance_id is not None and relation_tuple.relation == "belong to":
+            slot_name = _lookup_belong_to_slot(relation_tuple.target)
+            if slot_name is not None:
+                short_memory.update_noun_instance_metadata(
+                    relation_tuple.source_instance_id,
+                    noun_text=relation_tuple.source,
+                    extra_attributes={slot_name: relation_tuple.target},
+                )
+
     for relation_state in relation_states:
         short_memory.append_relation(
             relation_name=relation_state.relation,
@@ -1703,6 +2099,13 @@ def append_sentence_to_short_memory(
             action_tuple.noun,
             action_tuple.noun_instance_id,
         )
+        if action_tuple.owner_instance_id is not None or action_tuple.owner_role is not None:
+            short_memory.update_noun_instance_metadata(
+                noun_instance_id,
+                noun_text=action_tuple.noun,
+                owner_instance_id=action_tuple.owner_instance_id,
+                owner_role=action_tuple.owner_role,
+            )
         action_key = action_tuple.action.lower()
         if action_key not in action_type_map:
             raise ValueError(f"Action '{action_tuple.action}' not found in action_type_map")

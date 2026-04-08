@@ -37,6 +37,8 @@ DEFAULT_NOUNS = [
     "time",
     "space",
     "animal",
+    "teacher",
+    "job",
 ]
 
 DEFAULT_RELATIONS = [
