@@ -179,6 +179,7 @@ class Consciousness:
         grammar = self._grammar()
         before_event_count = len(self.short_memory.short_memory_event)
         before_relation_count = len(self.short_memory.short_memory_relation)
+        before_reward_count = len(self.short_memory.short_memory_reward)
         parsed = grammar.parse_sentence(
             sentence,
             adjective_relation_types=adjective_relation_types,
@@ -200,8 +201,10 @@ class Consciousness:
             "tokens": [token.text if hasattr(token, "text") else str(token) for token in parsed.tokens],
             "action_count": len(parsed.action_tuples),
             "relation_count": len(parsed.relation_tuples),
+            "reward_count": len(parsed.reward_tuples),
             "event_entries_added": len(self.short_memory.short_memory_event) - before_event_count,
             "relation_entries_added": len(self.short_memory.short_memory_relation) - before_relation_count,
+            "reward_entries_added": len(self.short_memory.short_memory_reward) - before_reward_count,
             "states": states,
         }
 
@@ -265,7 +268,9 @@ class Consciousness:
             return self.short_memory.get_event_content_view(order_by=order_by)
         if kind == "relation":
             return self.short_memory.get_relation_content_view(order_by=order_by)
-        raise ValueError("kind must be one of: all, event, relation")
+        if kind == "reward":
+            return self.short_memory.get_reward_content_view(order_by=order_by)
+        raise ValueError("kind must be one of: all/event/relation/reward")
 
     def inspect_focus(self, steps=None):
         """Return the current focus event used by the world model.
@@ -337,16 +342,33 @@ class Consciousness:
             "entries": related_entries,
         }
 
-    def rebuild_instance(self, instance_id: str, step_scale: Optional[float] = None):
-        """Rebuild one noun instance embedding from current short-memory relations.
+    def rebuild_instance(
+        self,
+        instance_id: str,
+        step_scale: Optional[float] = None,
+        *,
+        reward_model=None,
+        reward_encoder=None,
+    ):
+        """Rebuild one noun instance embedding from short-memory relation/reward evidence.
 
         Input:
             instance_id: noun instance identifier.
             step_scale: optional scaling factor.
+            reward_model: optional SubjectEventRewardNet for including reward losses.
+            reward_encoder: optional RewardEncoder for including reward losses.
         Output:
             dict: whether an update happened and the resulting norm.
         """
-        embedding = self.short_memory.rebuild_instance_embedding(instance_id, step_scale=step_scale)
+        if reward_model is not None and reward_encoder is not None:
+            embedding = self.short_memory.rebuild_instance_embedding_from_relation_and_reward(
+                instance_id,
+                reward_model=reward_model,
+                reward_encoder=reward_encoder,
+                step_scale=step_scale,
+            )
+        else:
+            embedding = self.short_memory.rebuild_instance_embedding(instance_id, step_scale=step_scale)
         return {
             "instance_id": instance_id,
             "updated": embedding is not None,

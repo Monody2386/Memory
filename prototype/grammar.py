@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from world.action_vocab import ensure_action
-from prototype.instance_metadata import PRONOUN_LIST, POSSESSIVE_LIST, POSSESSIVE_NOUN_LIST, possessive_owner_role, pronoun_filters, is_named_person_noun
+from prototype.instance_metadata import ARTICLE_LIST, PRONOUN_LIST, POSSESSIVE_LIST, POSSESSIVE_NOUN_LIST, possessive_owner_role, pronoun_filters, is_named_person_noun
 from prototype.grammar_routes import DEFAULT_EXTRACTOR_ROUTES
 
 
@@ -52,6 +52,7 @@ class ActionTuple:
     owner_instance_id: Optional[str] = None
     owner_role: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
+    polarity: int = 1
 
 
 @dataclass
@@ -65,6 +66,19 @@ class RelationTuple:
     owner_instance_id: Optional[str] = None
     owner_role: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
+    polarity: int = 1
+
+
+@dataclass
+class RewardTuple:
+    subject: str
+    reward_word: str
+    reward_value: float
+    action: Optional[str] = None
+    object: Optional[str] = None
+    subject_instance_id: Optional[str] = None
+    object_instance_id: Optional[str] = None
+    source_tokens: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -74,6 +88,7 @@ class InstanceAttributeUpdate:
     attribute_value: str
     noun_text: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
+    polarity: int = 1
 
 
 @dataclass
@@ -86,6 +101,7 @@ class ParsedSentence:
     sentence_type: str = "unknown_sentence"
     action_tuples: List[ActionTuple] = field(default_factory=list)
     relation_tuples: List[RelationTuple] = field(default_factory=list)
+    reward_tuples: List[RewardTuple] = field(default_factory=list)
     instance_updates: List[InstanceAttributeUpdate] = field(default_factory=list)
 
 
@@ -115,6 +131,7 @@ class ShortMemoryState:
     role: str
     adjectives: List[str]
     pair_kind: str = "noun_action"
+    polarity: int = 1
 
 
 @dataclass
@@ -131,6 +148,7 @@ class ShortMemoryRelationState:
     target_embedding: Optional[torch.Tensor]
     time_position: int
     pair_index: int
+    polarity: int = 1
 
 
 @dataclass
@@ -157,13 +175,17 @@ class KnowledgeTrainingSamples:
     adj_noun_samples: List[AdjNounRelationSample] = field(default_factory=list)
 
 
-IRREGULAR_OBJECT_ACTIONS = {
-    "eat": "eaten",
-    "see": "seen",
-    "write": "written",
-    "take": "taken",
-    "drive": "driven",
-}
+ACTION_FORM_PAIRS = [
+    ("eat", "eaten"),
+    ("see", "seen"),
+    ("write", "written"),
+    ("take", "taken"),
+    ("drive", "driven"),
+]
+ACTIVE_TO_ACTIONED = dict(ACTION_FORM_PAIRS)
+ACTIONED_TO_ACTIVE = {actioned: active for active, actioned in ACTION_FORM_PAIRS}
+# Backward-compatible name: object-side events use the actioned/passive form.
+IRREGULAR_OBJECT_ACTIONS = ACTIVE_TO_ACTIONED
 
 ADJECTIVE_RELATION_HINTS = {
     "red": "color",
@@ -191,6 +213,14 @@ STANDALONE_POSSESSIVE_EXPANSIONS = {
     "theirs": "their",
 }
 BE_VERB_SET = {"am", "is", "are", "was", "were", "be", "been", "being"}
+HELPER_WORD_SET = {"by", "do", "does", "did"}
+NEGATIVE_WORD_SET = {"not", "no", "never", "n't"}
+REWARD_WORD_VALUE_MAP = {
+    "hate": -100.0,
+    "dislike": -60.0,
+    "like": 60.0,
+    "love": 100.0,
+}
 
 
 # ===========================================================================
@@ -216,14 +246,22 @@ def tokenize_sentence(
 
 
 def object_action_form(verb: str) -> str:
+    """Return the actioned form used by object-side event pairs."""
     verb = verb.lower()
-    if verb in IRREGULAR_OBJECT_ACTIONS:
-        return IRREGULAR_OBJECT_ACTIONS[verb]
-    if verb.endswith("e"):
-        return verb + "d"
-    if len(verb) >= 3 and verb[-1] not in "aeiou" and verb[-2] in "aeiou" and verb[-3] not in "aeiou":
-        return verb + verb[-1] + "ed"
+    if verb in ACTIVE_TO_ACTIONED:
+        return ACTIVE_TO_ACTIONED[verb]
+    # Productive default for new actions. Irregular forms can be added to ACTION_FORM_PAIRS.
     return verb + "ed"
+
+
+def subject_action_form(actioned: str) -> str:
+    """Return the active action form that corresponds to an actioned/passive token."""
+    actioned = actioned.lower()
+    if actioned in ACTIONED_TO_ACTIVE:
+        return ACTIONED_TO_ACTIVE[actioned]
+    if actioned.endswith("ed") and len(actioned) > 2:
+        return actioned[:-2]
+    return actioned
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +370,14 @@ def _build_pos_lexicons():
         "pronouns": set(PRONOUN_LIST),
         "possessives": set(POSSESSIVE_LIST),
         "possessive_nouns": set(POSSESSIVE_NOUN_LIST),
+        "articles": set(ARTICLE_LIST),
+        "helpers": set(HELPER_WORD_SET),
+        "negative_words": set(NEGATIVE_WORD_SET),
         "actions": {action.lower() for action in action_vocab.action_list},
+        "actioned_words": {object_action_form(action.lower()) for action in action_vocab.action_list}
+        | set(ACTIONED_TO_ACTIVE.keys()),
         "be_verbs": set(BE_VERB_SET),
+        "reward_words": set(REWARD_WORD_VALUE_MAP),
         "relations": [relation.lower() for relation in rm.relation_list],
         "relation_tokens": relation_tokens,
     }
@@ -387,11 +431,29 @@ def tag_tokens(
         if token in lexicons["possessives"]:
             tagged_tokens.append(TaggedToken(text=token, pos="possessive", index=index, source="possessive_list", entity_text=token))
             continue
+        if token in lexicons["articles"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="article", index=index, source="article_list", entity_text=token))
+            continue
         if token in lexicons["be_verbs"]:
             tagged_tokens.append(TaggedToken(text=token, pos="be", index=index, source="be_verb_list", entity_text=token))
             continue
+        if token in lexicons["helpers"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="helper", index=index, source="helper_word_list", entity_text=token))
+            continue
+        if token in lexicons["negative_words"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="negative", index=index, source="negative_word_list", entity_text=token))
+            continue
         if token in lexicons["pronouns"]:
             tagged_tokens.append(TaggedToken(text=token, pos="pronoun", index=index, source="pronoun_list", entity_text=token))
+            continue
+        if token in lexicons["reward_words"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="reward", index=index, source="reward_word_list", entity_text=token))
+            continue
+        if token in lexicons["actioned_words"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="actioned", index=index, source="actioned_form_list", entity_text=token))
+            continue
+        if token in lexicons["actions"]:
+            tagged_tokens.append(TaggedToken(text=token, pos="action", index=index, source="action_list", entity_text=token))
             continue
 
         token_info = question_engine.what_is_token(token, position=index, tokens=tokens)
@@ -609,6 +671,8 @@ def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
         return "attribute_sentence"
     if has_instance_update:
         return "instance_update_sentence"
+    if parsed.reward_tuples:
+        return "reward_sentence"
     return "unknown_sentence"
 
 
@@ -969,6 +1033,84 @@ def _reduce_adj_noun_phrases(
     return reduced_tokens, reduced_tags, extracted_relations
 
 
+def _reduce_article_noun_phrases(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    instance_context=None,
+    short_memory=None,
+) -> Tuple[List[str], List[TaggedToken]]:
+    resolved_context = _coerce_instance_context(
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    reduced_tokens: List[str] = []
+    reduced_tags: List[TaggedToken] = []
+    index = 0
+    create_counters: Dict[str, int] = {}
+
+    while index < len(tagged_tokens):
+        if (
+            index + 1 < len(tagged_tokens)
+            and tagged_tokens[index].pos == "article"
+            and tagged_tokens[index + 1].pos == "noun"
+        ):
+            article_text = tokens[index].lower()
+            head_tag = tagged_tokens[index + 1]
+            head_noun = _token_entity_text(tokens[index + 1], head_tag)
+            noun_instance_id = head_tag.instance_id
+            if noun_instance_id is None:
+                if article_text == "the":
+                    noun_instance_id = _resolve_existing_instance_id(head_noun, resolved_context, {})
+                elif article_text in {"a", "an"}:
+                    noun_instance_id = _build_instance_id(
+                        head_noun,
+                        create_counters,
+                        instance_context=resolved_context,
+                    )
+                else:
+                    noun_instance_id = _resolve_existing_instance_id(head_noun, resolved_context, {})
+            if noun_instance_id is None:
+                noun_instance_id = _build_instance_id(head_noun, create_counters, instance_context=resolved_context)
+            reduced_tokens.append(noun_instance_id)
+            reduced_tags.append(
+                TaggedToken(
+                    text=noun_instance_id,
+                    pos="noun",
+                    index=head_tag.index,
+                    source="reduction_article_noun",
+                    question_prompt=None,
+                    instance_id=noun_instance_id,
+                    entity_text=head_noun,
+                    owner_instance_id=head_tag.owner_instance_id,
+                    owner_role=head_tag.owner_role,
+                )
+            )
+            index += 2
+            continue
+
+        reduced_tokens.append(tokens[index])
+        reduced_tags.append(tagged_tokens[index])
+        index += 1
+
+    return reduced_tokens, reduced_tags
+
+
+def _reduce_helper_tokens(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+) -> Tuple[List[str], List[TaggedToken]]:
+    """Drop grammar helper tokens after POS tagging and before extractor routing."""
+    reduced_tokens: List[str] = []
+    reduced_tags: List[TaggedToken] = []
+    for token, tag in zip(tokens, tagged_tokens):
+        if tag.pos == "helper":
+            continue
+        reduced_tokens.append(token)
+        reduced_tags.append(tag)
+    return reduced_tokens, reduced_tags
+
+
 def _bind_existing_noun_instances(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
@@ -1062,10 +1204,11 @@ def _lookup_belong_to_slot(noun: str) -> Optional[str]:
     return None
 
 
-def _extract_pattern_be_noun(
+def _extract_pattern_be_noun_core(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
+    polarity: int = 1,
     adjective_relation_types=None,
     infer_missing: bool = True,
     instance_context=None,
@@ -1080,7 +1223,7 @@ def _extract_pattern_be_noun(
         tokens=list(tokens),
         tagged_tokens=list(tagged_tokens),
         structure=tuple(tag.pos for tag in tagged_tokens),
-        pattern_name="be_noun",
+        pattern_name="be_noun" if polarity == 1 else "negative_be_noun",
         sentence_type="relation_sentence",
     )
 
@@ -1097,6 +1240,7 @@ def _extract_pattern_be_noun(
                     attribute_value=right_noun,
                     noun_text=None,
                     source_tokens=list(tokens),
+                    polarity=int(polarity),
                 )
             )
             parsed.sentence_type = "instance_update_sentence"
@@ -1112,6 +1256,7 @@ def _extract_pattern_be_noun(
                     attribute_value=right_noun,
                     noun_text=left_noun,
                     source_tokens=list(tokens),
+                    polarity=int(polarity),
                 )
             )
             parsed.sentence_type = "instance_update_sentence"
@@ -1132,7 +1277,147 @@ def _extract_pattern_be_noun(
             owner_instance_id=left_owner_instance_id,
             owner_role=left_owner_role,
             source_tokens=list(tokens),
+            polarity=int(polarity),
         )
+    )
+    return parsed
+
+
+def _extract_pattern_be_noun(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    return _extract_pattern_be_noun_core(
+        tokens,
+        tagged_tokens,
+        polarity=1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+
+
+def _extract_pattern_negative_be_noun(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    reduced_tokens = [tokens[0], tokens[1], tokens[3]]
+    reduced_tags = [tagged_tokens[0], tagged_tokens[1], tagged_tokens[3]]
+    return _extract_pattern_be_noun_core(
+        reduced_tokens,
+        reduced_tags,
+        polarity=-1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+
+
+def _extract_pattern_reward_sentence(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) not in {3, 4}:
+        raise ValueError("reward sentence requires noun + reward + action/noun")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    subject_instance_id = tagged_tokens[0].instance_id
+    reward_word = tokens[1].lower()
+    reward_value = REWARD_WORD_VALUE_MAP.get(reward_word)
+    if reward_value is None:
+        raise ValueError(f"Unknown reward word: {reward_word}")
+
+    action_text = None
+    object_text = None
+    object_instance_id = None
+
+    if tagged_tokens[2].pos == "action":
+        action_text = tokens[2].lower()
+        if len(tokens) == 4:
+            object_text = _token_entity_text(tokens[3], tagged_tokens[3])
+            object_instance_id = tagged_tokens[3].instance_id
+    elif tagged_tokens[2].pos == "noun" and len(tokens) == 3:
+        object_text = _token_entity_text(tokens[2], tagged_tokens[2])
+        object_instance_id = tagged_tokens[2].instance_id
+    else:
+        raise ValueError(f"Unsupported reward sentence structure: {tuple(tag.pos for tag in tagged_tokens)}")
+
+    return ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="noun_reward",
+        sentence_type="reward_sentence",
+        reward_tuples=[
+            RewardTuple(
+                subject=subject,
+                reward_word=reward_word,
+                reward_value=float(reward_value),
+                action=action_text,
+                object=object_text,
+                subject_instance_id=subject_instance_id,
+                object_instance_id=object_instance_id,
+                source_tokens=list(tokens),
+            )
+        ],
+    )
+
+
+def _extract_pattern_intransitive_action(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 2:
+        raise ValueError("noun_action sentence requires exactly noun + action")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    subject_instance_id = tagged_tokens[0].instance_id
+    verb = tokens[1]
+
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="noun_action",
+        sentence_type="action_sentence",
+        action_tuples=[
+            ActionTuple(
+                noun=subject,
+                action=verb,
+                role="subject",
+                position=0,
+                noun_instance_id=subject_instance_id,
+                owner_instance_id=tagged_tokens[0].owner_instance_id,
+                owner_role=tagged_tokens[0].owner_role,
+                source_tokens=[subject, verb],
+            )
+        ],
     )
     return parsed
 
@@ -1193,10 +1478,263 @@ def _extract_pattern_action_with_object(
     return parsed
 
 
-def _extract_pattern_be_attribute(
+def _extract_pattern_negative_intransitive_action(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 3:
+        raise ValueError("negative noun_action sentence requires noun + negative + action")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    verb = tokens[2].lower()
+    return ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="negative_noun_action",
+        sentence_type="action_sentence",
+        action_tuples=[
+            ActionTuple(
+                noun=subject,
+                action=verb,
+                role="subject",
+                position=0,
+                noun_instance_id=tagged_tokens[0].instance_id,
+                owner_instance_id=tagged_tokens[0].owner_instance_id,
+                owner_role=tagged_tokens[0].owner_role,
+                source_tokens=[subject, tokens[1].lower(), verb],
+                polarity=-1,
+            )
+        ],
+    )
+
+
+def _extract_pattern_negative_action_with_object(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) < 4:
+        raise ValueError("negative action sentence requires noun + negative + action + object")
+
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="negative_noun_action_object_phrase",
+        sentence_type="action_sentence",
+    )
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    verb = tokens[2].lower()
+    object_noun, _, object_instance_id, object_owner_instance_id, object_owner_role = _parse_noun_phrase(
+        list(tokens[3:]),
+        list(tagged_tokens[3:]),
+    )
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=object_noun,
+            action=object_action_form(verb),
+            role="object",
+            position=1,
+            noun_instance_id=object_instance_id,
+            owner_instance_id=object_owner_instance_id,
+            owner_role=object_owner_role,
+            source_tokens=list(tokens[3:]),
+            polarity=-1,
+        )
+    )
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=subject,
+            action=verb,
+            role="subject",
+            position=0,
+            noun_instance_id=tagged_tokens[0].instance_id,
+            owner_instance_id=tagged_tokens[0].owner_instance_id,
+            owner_role=tagged_tokens[0].owner_role,
+            source_tokens=[subject, tokens[1].lower(), verb],
+            polarity=-1,
+        )
+    )
+    return parsed
+
+
+def _extract_pattern_passive_action_without_subject(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 3:
+        raise ValueError("passive action sentence requires noun + be + actioned")
+
+    object_noun = _token_entity_text(tokens[0], tagged_tokens[0])
+    actioned = tokens[2].lower()
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="passive_action_without_subject",
+        sentence_type="action_sentence",
+    )
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=object_noun,
+            action=actioned,
+            role="object",
+            position=1,
+            noun_instance_id=tagged_tokens[0].instance_id,
+            owner_instance_id=tagged_tokens[0].owner_instance_id,
+            owner_role=tagged_tokens[0].owner_role,
+            source_tokens=[object_noun, actioned],
+            polarity=1,
+        )
+    )
+    return parsed
+
+
+def _extract_pattern_negative_passive_action_without_subject(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    if len(tokens) != 4:
+        raise ValueError("negative passive action sentence requires noun + be + negative + actioned")
+    reduced_tokens = [tokens[0], tokens[1], tokens[3]]
+    reduced_tags = [tagged_tokens[0], tagged_tokens[1], tagged_tokens[3]]
+    parsed = _extract_pattern_passive_action_without_subject(
+        reduced_tokens,
+        reduced_tags,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.pattern_name = "negative_passive_action_without_subject"
+    parsed.tokens = list(tokens)
+    parsed.tagged_tokens = list(tagged_tokens)
+    parsed.structure = tuple(tag.pos for tag in tagged_tokens)
+    for action_tuple in parsed.action_tuples:
+        action_tuple.polarity = -1
+    return parsed
+
+
+def _extract_pattern_passive_action_with_subject(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 4:
+        raise ValueError("passive action sentence requires noun + be + actioned + noun")
+
+    object_noun = _token_entity_text(tokens[0], tagged_tokens[0])
+    object_instance_id = tagged_tokens[0].instance_id
+    actioned = tokens[2].lower()
+    active_action = subject_action_form(actioned)
+    subject_noun = _token_entity_text(tokens[3], tagged_tokens[3])
+    subject_instance_id = tagged_tokens[3].instance_id
+
+    parsed = ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="passive_action_with_subject",
+        sentence_type="action_sentence",
+    )
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=subject_noun,
+            action=active_action,
+            role="subject",
+            position=0,
+            noun_instance_id=subject_instance_id,
+            owner_instance_id=tagged_tokens[3].owner_instance_id,
+            owner_role=tagged_tokens[3].owner_role,
+            source_tokens=[subject_noun, active_action],
+            polarity=1,
+        )
+    )
+    # Passive sentences focus the affected object, so keep the object-side event last.
+    parsed.action_tuples.append(
+        ActionTuple(
+            noun=object_noun,
+            action=actioned,
+            role="object",
+            position=1,
+            noun_instance_id=object_instance_id,
+            owner_instance_id=tagged_tokens[0].owner_instance_id,
+            owner_role=tagged_tokens[0].owner_role,
+            source_tokens=[object_noun, actioned],
+            polarity=1,
+        )
+    )
+    return parsed
+
+
+def _extract_pattern_negative_passive_action_with_subject(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    if len(tokens) != 5:
+        raise ValueError("negative passive sentence requires noun + be + negative + actioned + noun")
+    reduced_tokens = [tokens[0], tokens[1], tokens[3], tokens[4]]
+    reduced_tags = [tagged_tokens[0], tagged_tokens[1], tagged_tokens[3], tagged_tokens[4]]
+    parsed = _extract_pattern_passive_action_with_subject(
+        reduced_tokens,
+        reduced_tags,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.pattern_name = "negative_passive_action_with_subject"
+    parsed.tokens = list(tokens)
+    parsed.tagged_tokens = list(tagged_tokens)
+    parsed.structure = tuple(tag.pos for tag in tagged_tokens)
+    for action_tuple in parsed.action_tuples:
+        action_tuple.polarity = -1
+    return parsed
+
+
+def _extract_pattern_be_attribute_core(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    polarity: int = 1,
     adjective_relation_types=None,
     infer_missing: bool = True,
     instance_context=None,
@@ -1209,7 +1747,7 @@ def _extract_pattern_be_attribute(
         tokens=list(tokens),
         tagged_tokens=list(tagged_tokens),
         structure=tuple(tag.pos for tag in tagged_tokens),
-        pattern_name="be_attribute",
+        pattern_name="be_attribute" if polarity == 1 else "negative_be_attribute",
         sentence_type="attribute_sentence",
     )
 
@@ -1249,16 +1787,60 @@ def _extract_pattern_be_attribute(
                 owner_instance_id=tagged_tokens[0].owner_instance_id,
                 owner_role=tagged_tokens[0].owner_role,
                 source_tokens=list(tokens),
+                polarity=int(polarity),
             )
         )
 
     return parsed
 
 
+def _extract_pattern_be_attribute(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    return _extract_pattern_be_attribute_core(
+        tokens,
+        tagged_tokens,
+        polarity=1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+
+
+def _extract_pattern_negative_be_attribute(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    reduced_tokens = [tokens[0], tokens[1], *tokens[3:]]
+    reduced_tags = [tagged_tokens[0], tagged_tokens[1], *tagged_tokens[3:]]
+    return _extract_pattern_be_attribute_core(
+        reduced_tokens,
+        reduced_tags,
+        polarity=-1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+
+
 def _extract_pattern_relation_between_noun_phrases(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
+    polarity: int = 1,
     adjective_relation_types=None,
     infer_missing: bool = True,
     instance_context=None,
@@ -1300,9 +1882,37 @@ def _extract_pattern_relation_between_noun_phrases(
             owner_instance_id=left_owner_instance_id,
             owner_role=left_owner_role,
             source_tokens=list(tokens),
+            polarity=int(polarity),
         )
     )
 
+    return parsed
+
+
+def _extract_pattern_negative_relation_between_noun_phrases(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    reduced_tokens = [tokens[0], *tokens[2:]]
+    reduced_tags = [tagged_tokens[0], *tagged_tokens[2:]]
+    parsed = _extract_pattern_relation_between_noun_phrases(
+        reduced_tokens,
+        reduced_tags,
+        polarity=-1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.pattern_name = "negative_noun_phrase_relation_noun_phrase"
+    parsed.tokens = list(tokens)
+    parsed.tagged_tokens = list(tagged_tokens)
+    parsed.structure = tuple(tag.pos for tag in tagged_tokens)
     return parsed
 
 
@@ -1354,9 +1964,20 @@ def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken
     structure = _structure_for_extractor_routing(tagged_tokens)
     extractor_map = {
         "_extract_pattern_be_attribute": _extract_pattern_be_attribute,
+        "_extract_pattern_negative_be_attribute": _extract_pattern_negative_be_attribute,
         "_extract_pattern_be_noun": _extract_pattern_be_noun,
+        "_extract_pattern_negative_be_noun": _extract_pattern_negative_be_noun,
+        "_extract_pattern_reward_sentence": _extract_pattern_reward_sentence,
+        "_extract_pattern_intransitive_action": _extract_pattern_intransitive_action,
         "_extract_pattern_action_with_object": _extract_pattern_action_with_object,
+        "_extract_pattern_negative_intransitive_action": _extract_pattern_negative_intransitive_action,
+        "_extract_pattern_negative_action_with_object": _extract_pattern_negative_action_with_object,
+        "_extract_pattern_passive_action_without_subject": _extract_pattern_passive_action_without_subject,
+        "_extract_pattern_negative_passive_action_without_subject": _extract_pattern_negative_passive_action_without_subject,
+        "_extract_pattern_passive_action_with_subject": _extract_pattern_passive_action_with_subject,
+        "_extract_pattern_negative_passive_action_with_subject": _extract_pattern_negative_passive_action_with_subject,
         "_extract_pattern_relation_between_noun_phrases": _extract_pattern_relation_between_noun_phrases,
+        "_extract_pattern_negative_relation_between_noun_phrases": _extract_pattern_negative_relation_between_noun_phrases,
     }
 
     for route in DEFAULT_EXTRACTOR_ROUTES:
@@ -1415,6 +2036,16 @@ def parse_sentence(
         reduced_tags,
         instance_context=instance_context,
         short_memory=short_memory,
+    )
+    reduced_tokens, reduced_tags = _reduce_article_noun_phrases(
+        reduced_tokens,
+        reduced_tags,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    reduced_tokens, reduced_tags = _reduce_helper_tokens(
+        reduced_tokens,
+        reduced_tags,
     )
     reduced_tokens, reduced_tags = _bind_existing_noun_instances(
         reduced_tokens,
@@ -1588,6 +2219,7 @@ def resolve_instances_for_parsed_sentence(
                 owner_instance_id=action_tuple.owner_instance_id,
                 owner_role=action_tuple.owner_role,
                 source_tokens=list(action_tuple.source_tokens),
+                polarity=action_tuple.polarity,
             )
         )
 
@@ -1615,6 +2247,40 @@ def resolve_instances_for_parsed_sentence(
                 owner_instance_id=relation_tuple.owner_instance_id,
                 owner_role=relation_tuple.owner_role,
                 source_tokens=list(relation_tuple.source_tokens),
+                polarity=relation_tuple.polarity,
+            )
+        )
+
+    resolved_rewards: List[RewardTuple] = []
+    for reward_tuple in parsed.reward_tuples:
+        subject_instance_id = reward_tuple.subject_instance_id
+        if subject_instance_id is None:
+            subject_instance_id = sentence_assignments.get(reward_tuple.subject)
+        if subject_instance_id is None:
+            subject_instance_id = _resolve_existing_instance_id(reward_tuple.subject, resolved_context, sentence_assignments)
+        if subject_instance_id is None:
+            subject_instance_id = _build_instance_id(reward_tuple.subject, create_counters, instance_context=resolved_context)
+        sentence_assignments[reward_tuple.subject] = subject_instance_id
+
+        object_instance_id = reward_tuple.object_instance_id
+        if reward_tuple.object is not None and object_instance_id is None:
+            object_instance_id = sentence_assignments.get(reward_tuple.object)
+            if object_instance_id is None:
+                object_instance_id = _resolve_existing_instance_id(reward_tuple.object, resolved_context, sentence_assignments)
+            if object_instance_id is None:
+                object_instance_id = _build_instance_id(reward_tuple.object, create_counters, instance_context=resolved_context)
+            sentence_assignments[reward_tuple.object] = object_instance_id
+
+        resolved_rewards.append(
+            RewardTuple(
+                subject=reward_tuple.subject,
+                reward_word=reward_tuple.reward_word,
+                reward_value=reward_tuple.reward_value,
+                action=reward_tuple.action,
+                object=reward_tuple.object,
+                subject_instance_id=subject_instance_id,
+                object_instance_id=object_instance_id,
+                source_tokens=list(reward_tuple.source_tokens),
             )
         )
 
@@ -1627,6 +2293,7 @@ def resolve_instances_for_parsed_sentence(
         sentence_type=parsed.sentence_type,
         action_tuples=resolved_actions,
         relation_tuples=resolved_relations,
+        reward_tuples=resolved_rewards,
         instance_updates=list(parsed.instance_updates),
     )
 
@@ -1932,6 +2599,7 @@ def parsed_sentence_to_relation_memory_states(
                 target_embedding=target_embedding,
                 time_position=int(time_position),
                 pair_index=pair_index,
+                polarity=relation_tuple.polarity,
             )
         )
 
@@ -2024,6 +2692,7 @@ def append_sentence_to_short_memory(
         explicit_time_position=time_position,
     )
     action_type_map = action_type_map or build_action_type_map(world_model)
+    sentence_event_index = short_memory.next_event_index() if parsed.action_tuples else None
 
     relation_states = parsed_sentence_to_relation_memory_states(
         parsed=parsed,
@@ -2033,6 +2702,7 @@ def append_sentence_to_short_memory(
     for instance_update in parsed.instance_updates:
         update_kwargs = {
             "extra_attributes": {instance_update.attribute_name: instance_update.attribute_value},
+            "attribute_polarities": {instance_update.attribute_name: instance_update.polarity},
         }
         if instance_update.noun_text is not None:
             update_kwargs["noun_text"] = instance_update.noun_text
@@ -2060,6 +2730,42 @@ def append_sentence_to_short_memory(
                     extra_attributes={slot_name: relation_tuple.target},
                 )
 
+    for pair_index, reward_tuple in enumerate(parsed.reward_tuples):
+        _, _, subject_instance_id = short_memory.ensure_noun_instance(
+            reward_tuple.subject,
+            reward_tuple.subject_instance_id,
+        )
+        object_instance_id = None
+        if reward_tuple.object is not None:
+            _, _, object_instance_id = short_memory.ensure_noun_instance(
+                reward_tuple.object,
+                reward_tuple.object_instance_id,
+            )
+        short_memory.append_reward(
+            subject_text=reward_tuple.subject,
+            subject_instance_id=subject_instance_id,
+            reward_word=reward_tuple.reward_word,
+            reward_value=reward_tuple.reward_value,
+            action_text=reward_tuple.action,
+            object_text=reward_tuple.object,
+            object_instance_id=object_instance_id,
+            score=base_score,
+            time_position=int(resolved_time_position),
+            pair_index=pair_index,
+            info_pair={
+                "pair_kind": "subject_event_reward",
+                "subject": reward_tuple.subject,
+                "subject_instance_id": subject_instance_id,
+                "reward_word": reward_tuple.reward_word,
+                "reward_value": reward_tuple.reward_value,
+                "action": reward_tuple.action,
+                "object": reward_tuple.object,
+                "object_instance_id": object_instance_id,
+                "time_position": int(resolved_time_position),
+                "pair_index": pair_index,
+            },
+        )
+
     for relation_state in relation_states:
         short_memory.append_relation(
             relation_name=relation_state.relation,
@@ -2073,6 +2779,7 @@ def append_sentence_to_short_memory(
             target_instance_id=relation_state.target_instance_id,
             source_type=relation_state.source_index,
             target_type=relation_state.target_index,
+            polarity=relation_state.polarity,
             source_embedding=None,
             target_embedding=None,
             info_pair={
@@ -2084,6 +2791,7 @@ def append_sentence_to_short_memory(
                 "target_instance_id": relation_state.target_instance_id,
                 "time_position": relation_state.time_position,
                 "pair_index": relation_state.pair_index,
+                "polarity": relation_state.polarity,
             },
         )
 
@@ -2125,6 +2833,7 @@ def append_sentence_to_short_memory(
             pair_index=pair_index,
             role=action_tuple.role,
             adjectives=list(adjectives),
+            polarity=action_tuple.polarity,
         )
         states.append(state)
 
@@ -2132,6 +2841,7 @@ def append_sentence_to_short_memory(
             noun_embedding=state.noun_embedding,
             action_embedding=state.action_embedding,
             score=base_score,
+            event_index=sentence_event_index,
             noun_type=state.noun_index,
             action_type=state.action_type,
             time_position=state.time_position,
@@ -2142,15 +2852,18 @@ def append_sentence_to_short_memory(
             role=state.role,
             adjectives=list(state.adjectives),
             pair_kind=state.pair_kind,
+            polarity=state.polarity,
             info_pair={
                 "pair_kind": state.pair_kind,
                 "noun": state.noun,
                 "noun_instance_id": state.noun_instance_id,
                 "action": state.action,
                 "role": state.role,
+                "polarity": state.polarity,
                 "adjectives": list(state.adjectives),
                 "time_position": state.time_position,
                 "pair_index": state.pair_index,
+                "event_index": sentence_event_index,
             },
         )
 

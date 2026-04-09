@@ -19,11 +19,13 @@ class EventMemoryEntry:
     action_type: Optional[int]
     time_position: int
     pair_index: int
+    event_index: Optional[int]
     noun_instance_id: Optional[str]
     action_instance_id: Optional[str]
     noun_text: Optional[str] = None
     action_text: Optional[str] = None
     role: Optional[str] = None
+    polarity: int = 1
     pair_kind: str = "noun_action"
     adjectives: List[str] = field(default_factory=list)
     info_pair: Dict[str, Any] = field(default_factory=dict)
@@ -44,8 +46,24 @@ class RelationMemoryEntry:
     target_text: str
     source_instance_id: Optional[str] = None
     target_instance_id: Optional[str] = None
+    polarity: int = 1
     source_type: Optional[int] = None
     target_type: Optional[int] = None
+    info_pair: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RewardMemoryEntry:
+    score: float
+    reward_word: str
+    reward_value: float
+    time_position: int
+    pair_index: int
+    subject_text: str
+    subject_instance_id: str
+    action_text: Optional[str] = None
+    object_text: Optional[str] = None
+    object_instance_id: Optional[str] = None
     info_pair: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -76,12 +94,19 @@ class ShortMemory:
         self.relation_clone_step_scale = float(relation_clone_step_scale)
         self.event_entries: List[EventMemoryEntry] = []
         self.relation_entries: List[RelationMemoryEntry] = []
+        self.reward_entries: List[RewardMemoryEntry] = []
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_instance_metadata: Dict[str, Dict[str, Any]] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_relation_memory: Dict[str, torch.Tensor] = {}
         self.adj_relation_memory: Dict[str, torch.Tensor] = {}
         self._insert_counter = 0
+        self._event_counter = 0
+
+    def next_event_index(self) -> int:
+        event_index = int(self._event_counter)
+        self._event_counter += 1
+        return event_index
 
     @property
     def entries(self) -> List[EventMemoryEntry]:
@@ -94,6 +119,13 @@ class ShortMemory:
     @property
     def short_memory_relation(self) -> List[RelationMemoryEntry]:
         return self.relation_entries
+
+    @property
+    def short_memory_reward(self) -> List[RewardMemoryEntry]:
+        return self.reward_entries
+
+    def reward_list(self) -> List[RewardMemoryEntry]:
+        return list(self.reward_entries)
 
     def _resolve_state_dim(self, noun_embedding: torch.Tensor, action_embedding: torch.Tensor) -> int:
         candidate_dim = noun_embedding.view(-1).numel() + action_embedding.view(-1).numel()
@@ -179,6 +211,12 @@ class ShortMemory:
         referenced_nouns.update(
             entry.target_instance_id for entry in self.relation_entries if entry.target_instance_id is not None
         )
+        referenced_nouns.update(
+            entry.subject_instance_id for entry in self.reward_entries if entry.subject_instance_id is not None
+        )
+        referenced_nouns.update(
+            entry.object_instance_id for entry in self.reward_entries if entry.object_instance_id is not None
+        )
         referenced_actions = {
             entry.action_instance_id for entry in self.event_entries if entry.action_instance_id is not None
         }
@@ -197,6 +235,8 @@ class ShortMemory:
             self.event_entries.pop(0)
         while len(self.relation_entries) > self.maxlen:
             self.relation_entries.pop(0)
+        while len(self.reward_entries) > self.maxlen:
+            self.reward_entries.pop(0)
         self._prune_instance_stores()
 
     def _default_noun_instance_id(self, noun_type=None) -> str:
@@ -226,6 +266,7 @@ class ShortMemory:
             "owner_instance_id": None,
             "owner_role": None,
             "instance_scope": normalize_instance_scope(instance_scope),
+            "attribute_polarity": {},
         }
 
     def ensure_noun_instance_metadata(
@@ -263,6 +304,7 @@ class ShortMemory:
         owner_role: Optional[str] = None,
         instance_scope: Optional[str] = None,
         extra_attributes: Optional[Dict[str, Any]] = None,
+        attribute_polarities: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         metadata = self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
         if noun_text is not None:
@@ -279,6 +321,11 @@ class ShortMemory:
             metadata["instance_scope"] = normalize_instance_scope(instance_scope)
         if extra_attributes:
             metadata.update(dict(extra_attributes))
+        if attribute_polarities:
+            polarity_map = dict(metadata.get("attribute_polarity") or {})
+            for key, polarity in attribute_polarities.items():
+                polarity_map[str(key)] = int(polarity)
+            metadata["attribute_polarity"] = polarity_map
         self.noun_instance_metadata[instance_id] = dict(metadata)
         return dict(metadata)
 
@@ -381,6 +428,21 @@ class ShortMemory:
         self.store_noun_instance(instance_id, noun_embedding, noun_text=noun_text, instance_scope=instance_scope)
         return noun_idx, noun_embedding.detach().clone(), instance_id
 
+    def _weighted_mean_losses(self, losses: List[torch.Tensor], weights: Optional[List[float]] = None) -> torch.Tensor:
+        if not losses:
+            raise ValueError("losses must not be empty")
+        stacked_losses = torch.stack(losses)
+        if weights is None:
+            return stacked_losses.mean()
+        weight_tensor = torch.tensor(
+            [max(0.0, float(weight)) for weight in weights],
+            dtype=stacked_losses.dtype,
+            device=stacked_losses.device,
+        )
+        if float(weight_tensor.sum().item()) <= 1e-6:
+            return stacked_losses.mean()
+        return (stacked_losses * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
+
     def _relation_loss_for_entry(
         self,
         entry: RelationMemoryEntry,
@@ -433,41 +495,10 @@ class ShortMemory:
     def rebuild_instance_embedding(self, source_instance_id: Optional[str], step_scale: Optional[float] = None):
         if source_instance_id is None:
             return None
-
-        relevant_entries = self._collect_source_relations(source_instance_id)
-        if not relevant_entries:
-            return self.get_noun_embedding(source_instance_id)
-
-        rm, arm, kt = self._load_language_context()
-        source_entry = relevant_entries[-1]
-        noun_idx, base_embedding, resolved_instance_id = self.ensure_noun_instance(
-            source_entry.source_text,
+        return self.rebuild_instance_embedding_from_relation_and_reward(
             source_instance_id,
-            noun_type=source_entry.source_type,
+            step_scale=step_scale,
         )
-        noun_embedding = base_embedding.clone().detach().requires_grad_(True)
-
-        losses = []
-        for entry in relevant_entries:
-            loss = self._relation_loss_for_entry(entry, noun_embedding, rm, arm, kt)
-            if loss is not None:
-                losses.append(loss)
-
-        if not losses:
-            return noun_embedding.detach().clone()
-
-        total_loss = torch.stack(losses).mean()
-        total_loss.backward()
-
-        scale = self.relation_step_scale if step_scale is None else float(step_scale)
-        with torch.no_grad():
-            lr = float(rm.lr_per_embedding[noun_idx]) * scale
-            adjusted_noun_embedding = noun_embedding - lr * noun_embedding.grad
-
-        noun_embedding.grad.zero_()
-        source_text = source_entry.source_text if source_entry is not None else None
-        self.store_noun_instance(resolved_instance_id, adjusted_noun_embedding.detach(), noun_text=source_text)
-        return adjusted_noun_embedding.detach().clone()
 
     def rebuild_relation_clone(
         self,
@@ -490,6 +521,7 @@ class ShortMemory:
 
         relation_weight = base_relation_weight.clone().detach().requires_grad_(True)
         losses = []
+        loss_weights = []
 
         for entry in relevant_entries:
             source_embedding = self.get_noun_embedding(entry.source_instance_id)
@@ -520,12 +552,16 @@ class ShortMemory:
                 target_embedding = kt.adj_map_one.adjective_embedding.weight.data[adjective_idx].detach().clone()
 
             predicted_target = relation_weight @ source_embedding
-            losses.append(F.mse_loss(predicted_target, target_embedding))
+            relation_loss = F.mse_loss(predicted_target, target_embedding)
+            if int(getattr(entry, "polarity", 1)) == -1:
+                relation_loss = -relation_loss
+            losses.append(relation_loss)
+            loss_weights.append(float(entry.score))
 
         if not losses:
             return relation_weight.detach().clone()
 
-        total_loss = torch.stack(losses).mean()
+        total_loss = self._weighted_mean_losses(losses, loss_weights)
         total_loss.backward()
 
         scale = self.relation_clone_step_scale if step_scale is None else float(step_scale)
@@ -616,12 +652,14 @@ class ShortMemory:
         action_type=None,
         time_position: int = 0,
         pair_index: Optional[int] = None,
+        event_index: Optional[int] = None,
         noun_text: Optional[str] = None,
         action_text: Optional[str] = None,
         instance_id: Optional[str] = None,
         noun_instance_id: Optional[str] = None,
         action_instance_id: Optional[str] = None,
         role: Optional[str] = None,
+        polarity: int = 1,
         adjectives: Optional[List[str]] = None,
         pair_kind: str = "noun_action",
         info_pair: Optional[Dict[str, Any]] = None,
@@ -649,7 +687,9 @@ class ShortMemory:
             "action_type": None if action_type is None else int(action_type),
             "time_position": int(time_position),
             "pair_index": int(pair_index),
+            "event_index": None if event_index is None else int(event_index),
         }
+        base_info_pair["polarity"] = int(polarity)
         if role is not None:
             base_info_pair["role"] = role
         if info_pair:
@@ -661,11 +701,13 @@ class ShortMemory:
             action_type=None if action_type is None else int(action_type),
             time_position=int(time_position),
             pair_index=int(pair_index),
+            event_index=None if event_index is None else int(event_index),
             noun_instance_id=noun_instance_id,
             action_instance_id=action_instance_id,
             noun_text=noun_text,
             action_text=action_text,
             role=role,
+            polarity=int(polarity),
             pair_kind=pair_kind,
             adjectives=list(adjectives or []),
             info_pair=base_info_pair,
@@ -689,6 +731,7 @@ class ShortMemory:
         target_instance_id: Optional[str] = None,
         source_type: Optional[int] = None,
         target_type: Optional[int] = None,
+        polarity: int = 1,
         source_embedding: Optional[torch.Tensor] = None,
         target_embedding: Optional[torch.Tensor] = None,
         info_pair: Optional[Dict[str, Any]] = None,
@@ -740,6 +783,7 @@ class ShortMemory:
             target_text=target_text,
             source_instance_id=source_instance_id,
             target_instance_id=target_instance_id,
+            polarity=int(polarity),
             source_type=None if source_type is None else int(source_type),
             target_type=None if target_type is None else int(target_type),
             info_pair=base_info_pair,
@@ -758,6 +802,217 @@ class ShortMemory:
 
         self._trim()
         return dict(entry.info_pair)
+
+    def append_reward(
+        self,
+        *,
+        subject_text: str,
+        subject_instance_id: str,
+        reward_word: str,
+        reward_value: float,
+        action_text: Optional[str] = None,
+        object_text: Optional[str] = None,
+        object_instance_id: Optional[str] = None,
+        score: float = 1.0,
+        time_position: int = 0,
+        pair_index: Optional[int] = None,
+        info_pair: Optional[Dict[str, Any]] = None,
+    ):
+        if pair_index is None:
+            pair_index = len(self.reward_entries)
+
+        base_info_pair = {
+            "pair_kind": "subject_event_reward",
+            "subject_text": subject_text,
+            "subject_instance_id": subject_instance_id,
+            "reward_word": reward_word,
+            "reward_value": float(reward_value),
+            "action_text": action_text,
+            "object_text": object_text,
+            "object_instance_id": object_instance_id,
+            "time_position": int(time_position),
+            "pair_index": int(pair_index),
+        }
+        if info_pair:
+            base_info_pair.update(dict(info_pair))
+
+        entry = RewardMemoryEntry(
+            score=float(score),
+            reward_word=reward_word,
+            reward_value=float(reward_value),
+            time_position=int(time_position),
+            pair_index=int(pair_index),
+            subject_text=subject_text,
+            subject_instance_id=subject_instance_id,
+            action_text=action_text,
+            object_text=object_text,
+            object_instance_id=object_instance_id,
+            info_pair=base_info_pair,
+        )
+        self.reward_entries.append(entry)
+        self.reward_entries.sort(key=lambda item: (item.time_position, item.pair_index))
+        self._trim()
+        return dict(entry.info_pair)
+
+    def _reward_loss_for_subject_entry(
+        self,
+        entry: RewardMemoryEntry,
+        instance_id: str,
+        subject_embedding: torch.Tensor,
+        reward_model,
+        reward_encoder,
+    ) -> Optional[torch.Tensor]:
+        if entry.subject_instance_id != instance_id:
+            return None
+        action_embedding = reward_encoder.encode_action(action_text=entry.action_text)
+        object_embedding = reward_encoder.encode_noun(
+            noun_text=entry.object_text,
+            noun_instance_id=entry.object_instance_id,
+        )
+        prediction = reward_model(
+            subject_embedding=subject_embedding,
+            action_embedding=action_embedding,
+            object_embedding=object_embedding,
+        ).view(-1)[0]
+        target = torch.tensor(
+            float(entry.reward_value),
+            dtype=prediction.dtype,
+            device=prediction.device,
+        )
+        return F.smooth_l1_loss(prediction, target)
+
+    def rebuild_instance_embedding_from_relation_and_reward(
+        self,
+        instance_id: str,
+        *,
+        reward_model=None,
+        reward_encoder=None,
+        step_scale: Optional[float] = None,
+    ) -> Optional[torch.Tensor]:
+        metadata = self.get_noun_instance_metadata(instance_id)
+        noun_text = None if metadata is None else metadata.get("noun_text")
+        relation_entries = self._collect_source_relations(instance_id)
+        reward_entries = [
+            entry for entry in self.reward_entries
+            if entry.subject_instance_id == instance_id
+        ]
+        if not relation_entries and not reward_entries:
+            return self.get_noun_embedding(instance_id)
+
+        rm, arm, kt = self._load_language_context()
+        source_text = relation_entries[-1].source_text if relation_entries else noun_text
+        if source_text is None:
+            return self.get_noun_embedding(instance_id)
+        source_type = relation_entries[-1].source_type if relation_entries else None
+        noun_idx, base_embedding, resolved_instance_id = self.ensure_noun_instance(
+            source_text,
+            instance_id,
+            noun_type=source_type,
+        )
+        noun_embedding = base_embedding.clone().detach().requires_grad_(True)
+
+        losses = []
+        loss_weights = []
+        for entry in relation_entries:
+            loss = self._relation_loss_for_entry(entry, noun_embedding, rm, arm, kt)
+            if loss is not None:
+                if int(getattr(entry, "polarity", 1)) == -1:
+                    loss = -loss
+                losses.append(loss)
+                loss_weights.append(float(entry.score))
+
+        if reward_model is not None and reward_encoder is not None:
+            for entry in reward_entries:
+                loss = self._reward_loss_for_subject_entry(
+                    entry,
+                    instance_id,
+                    noun_embedding,
+                    reward_model,
+                    reward_encoder,
+                )
+                if loss is not None:
+                    losses.append(loss)
+                    loss_weights.append(float(entry.score))
+
+        if not losses:
+            return noun_embedding.detach().clone()
+
+        total_loss = self._weighted_mean_losses(losses, loss_weights)
+        total_loss.backward()
+        if noun_embedding.grad is None:
+            return noun_embedding.detach().clone()
+
+        scale = self.relation_step_scale if step_scale is None else float(step_scale)
+        with torch.no_grad():
+            lr = float(rm.lr_per_embedding[noun_idx]) * scale
+            adjusted_noun_embedding = noun_embedding - lr * noun_embedding.grad
+
+        noun_embedding.grad.zero_()
+        self.store_noun_instance(resolved_instance_id, adjusted_noun_embedding.detach(), noun_text=source_text)
+        return adjusted_noun_embedding.detach().clone()
+
+    def rebuild_instance_embedding_from_reward(
+        self,
+        instance_id: str,
+        *,
+        reward_model,
+        reward_encoder,
+        step_scale: float = 0.01,
+    ) -> Optional[torch.Tensor]:
+        involved_entries = [
+            entry for entry in self.reward_entries
+            if entry.subject_instance_id == instance_id
+        ]
+        if not involved_entries:
+            return None
+
+        base_embedding = self.get_noun_embedding(instance_id)
+        if base_embedding is None:
+            return None
+
+        trainable_embedding = base_embedding.detach().clone().requires_grad_(True)
+        losses = []
+        loss_weights = []
+        for entry in involved_entries:
+            subject_embedding = reward_encoder.encode_noun(
+                noun_text=entry.subject_text,
+                noun_instance_id=entry.subject_instance_id,
+            )
+            object_embedding = reward_encoder.encode_noun(
+                noun_text=entry.object_text,
+                noun_instance_id=entry.object_instance_id,
+            )
+            if entry.subject_instance_id == instance_id:
+                subject_embedding = trainable_embedding
+            action_embedding = reward_encoder.encode_action(action_text=entry.action_text)
+
+            prediction = reward_model(
+                subject_embedding=subject_embedding,
+                action_embedding=action_embedding,
+                object_embedding=object_embedding,
+            ).view(-1)[0]
+            target = torch.tensor(
+                float(entry.reward_value),
+                dtype=prediction.dtype,
+                device=prediction.device,
+            )
+            losses.append(F.smooth_l1_loss(prediction, target))
+            loss_weights.append(float(entry.score))
+
+        if not losses:
+            return None
+
+        total_loss = self._weighted_mean_losses(losses, loss_weights)
+        total_loss.backward()
+        if trainable_embedding.grad is None:
+            return None
+
+        with torch.no_grad():
+            updated_embedding = trainable_embedding - float(step_scale) * trainable_embedding.grad
+        metadata = self.get_noun_instance_metadata(instance_id)
+        noun_text = None if metadata is None else metadata.get("noun_text")
+        self.store_noun_instance(instance_id, updated_embedding.detach(), noun_text=noun_text)
+        return updated_embedding.detach().clone()
 
     def set_maxlen(self, new_maxlen):
         self.maxlen = new_maxlen
@@ -863,9 +1118,25 @@ class ShortMemory:
             return list(entries)
         return list(entries[-steps:]) if order_by == "time" else list(entries[:steps])
 
-    def build_world_model_event_input(self, steps=None):
+    def _world_model_selected_event_entries(self, steps=None) -> List[EventMemoryEntry]:
         self._reorder_event_entries_for_world_model()
-        selected = self.event_entries if steps is None else self.event_entries[-steps:]
+        selected = list(self.event_entries if steps is None else self.event_entries[-steps:])
+        if len(selected) <= 1:
+            return selected
+
+        focus = selected[-1]
+        focus_event_key = (focus.time_position, focus.event_index)
+        selected_for_input = []
+        for entry in selected:
+            same_focus_event = (entry.time_position, entry.event_index) == focus_event_key
+            is_negative = int(getattr(entry, "polarity", 1)) == -1
+            if is_negative and not same_focus_event:
+                continue
+            selected_for_input.append(entry)
+        return selected_for_input
+
+    def build_world_model_event_input(self, steps=None):
+        selected = self._world_model_selected_event_entries(steps=steps)
         if not selected:
             return torch.empty((0, 0), device=self.device)
         return torch.stack([self.get_entry_tensor(entry) for entry in selected], dim=1)
@@ -905,8 +1176,10 @@ class ShortMemory:
                 "action_text": entry.action_text,
                 "time_position": entry.time_position,
                 "pair_index": entry.pair_index,
+                "event_index": entry.event_index,
                 "score": entry.score,
                 "role": entry.role,
+                "polarity": entry.polarity,
             }
             for entry in entries
         ]
@@ -931,6 +1204,35 @@ class ShortMemory:
                 "time_position": entry.time_position,
                 "pair_index": entry.pair_index,
                 "score": entry.score,
+                "polarity": entry.polarity,
+            }
+            for entry in entries
+        ]
+
+    def get_reward_content_view(self, order_by: str = "time"):
+        if order_by == "time":
+            entries = self.reward_entries
+        elif order_by == "attention":
+            entries = sorted(
+                self.reward_entries,
+                key=lambda entry: (-entry.score, entry.time_position, entry.pair_index),
+            )
+        else:
+            raise ValueError("order_by must be 'time' or 'attention'")
+        return [
+            {
+                "pair_kind": "subject_event_reward",
+                "subject_text": entry.subject_text,
+                "subject_instance_id": entry.subject_instance_id,
+                "reward_word": entry.reward_word,
+                "reward_value": entry.reward_value,
+                "action_text": entry.action_text,
+                "object_text": entry.object_text,
+                "object_instance_id": entry.object_instance_id,
+                "time_position": entry.time_position,
+                "pair_index": entry.pair_index,
+                "event_index": entry.event_index,
+                "score": entry.score,
             }
             for entry in entries
         ]
@@ -939,6 +1241,7 @@ class ShortMemory:
         return {
             "event": self.get_event_content_view(order_by=order_by),
             "relation": self.get_relation_content_view(order_by=order_by),
+            "reward": self.get_reward_content_view(order_by=order_by),
         }
 
     def latest_state(self):
@@ -967,6 +1270,7 @@ class ShortMemory:
     def clear(self):
         self.event_entries.clear()
         self.relation_entries.clear()
+        self.reward_entries.clear()
         self.noun_instance_memory.clear()
         self.noun_instance_metadata.clear()
         self.action_instance_memory.clear()

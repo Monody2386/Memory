@@ -18,8 +18,14 @@ def main():
     context_sentences = [
         "tom is teacher",
         "his cat eat apple",
+        "that cat is red",
+        "mine eat banana",
+        "the cat eat fruit",
+        "a cat eat fruit",
+        "teacher belong to job",
+        "tom eat",
     ]
-    test_sentence = "mine eat banana"
+    test_sentence = "dog is animal"
 
     print("Grammar pipeline demo")
     print("This demo shows each grammar layer on a sentence with short-memory context.")

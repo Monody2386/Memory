@@ -12,6 +12,189 @@ class HighLevelCommands:
     """Task-level commands composed from low-level consciousness interfaces."""
 
     consciousness: Consciousness = field(default_factory=Consciousness)
+    _emotion_reward_encoder: Any = field(default=None, init=False, repr=False)
+    _subject_emotion_reward_model: Any = field(default=None, init=False, repr=False)
+    _subject_emotion_reward_engine: Any = field(default=None, init=False, repr=False)
+    _subject_emotion_reward_trainer: Any = field(default=None, init=False, repr=False)
+    _object_emotion_reward_model: Any = field(default=None, init=False, repr=False)
+    _object_emotion_reward_engine: Any = field(default=None, init=False, repr=False)
+    _object_emotion_reward_trainer: Any = field(default=None, init=False, repr=False)
+
+    def _emotion_reward_stack(self, role: str = "subject"):
+        """Create one reward model per event role: subject actor reward or object receiver reward."""
+        role = str(role).strip().lower()
+        if role not in {"subject", "object"}:
+            raise ValueError("role must be one of: subject, object")
+
+        if self._emotion_reward_encoder is None:
+            from reward import RewardEncoder
+            self._emotion_reward_encoder = RewardEncoder(self.consciousness)
+
+        from reward import SubjectEventRewardEngine, SubjectEventRewardNet, SubjectEventRewardTrainer
+        from world.world_model import action_dim, noun_dim
+
+        if role == "subject":
+            if self._subject_emotion_reward_engine is None:
+                self._subject_emotion_reward_model = SubjectEventRewardNet(
+                    noun_dim=noun_dim,
+                    action_dim=action_dim,
+                )
+                self._subject_emotion_reward_engine = SubjectEventRewardEngine(
+                    self._subject_emotion_reward_model,
+                    self._emotion_reward_encoder,
+                )
+                self._subject_emotion_reward_trainer = SubjectEventRewardTrainer(
+                    self._subject_emotion_reward_model,
+                    self._emotion_reward_encoder,
+                )
+            return (
+                self._emotion_reward_encoder,
+                self._subject_emotion_reward_model,
+                self._subject_emotion_reward_engine,
+                self._subject_emotion_reward_trainer,
+            )
+
+        if self._object_emotion_reward_engine is None:
+            self._object_emotion_reward_model = SubjectEventRewardNet(
+                noun_dim=noun_dim,
+                action_dim=action_dim,
+            )
+            self._object_emotion_reward_engine = SubjectEventRewardEngine(
+                self._object_emotion_reward_model,
+                self._emotion_reward_encoder,
+            )
+            self._object_emotion_reward_trainer = SubjectEventRewardTrainer(
+                self._object_emotion_reward_model,
+                self._emotion_reward_encoder,
+            )
+        return (
+            self._emotion_reward_encoder,
+            self._object_emotion_reward_model,
+            self._object_emotion_reward_engine,
+            self._object_emotion_reward_trainer,
+        )
+
+    def _noun_instance_ids(self, noun: str):
+        noun = str(noun).strip().lower()
+        matches = []
+        for instance_id, metadata in self.consciousness.short_memory.noun_instance_metadata.items():
+            noun_text = str(metadata.get("noun_text") or "").lower()
+            if noun_text == noun:
+                matches.append(instance_id)
+        return matches
+
+    def train_emotion_reward(self, *, epochs: int = 20):
+        """Train the subject emotion predictor from reward sentences in short memory."""
+        from reward import reward_samples_from_short_memory
+
+        _, _, _, trainer = self._emotion_reward_stack(role="subject")
+        samples = reward_samples_from_short_memory(self.consciousness.short_memory)
+        history = trainer.train_epochs(samples, epochs=epochs)
+        return {
+            "command": "train_emotion_reward",
+            "role": "subject",
+            "sample_count": len(samples),
+            "epochs": int(epochs),
+            "last_result": None if not history else history[-1],
+            "history": history,
+        }
+
+    def train_object_emotion_reward(self, samples, *, epochs: int = 20):
+        """Train the object emotion predictor from explicit object-reward samples."""
+        _, _, _, trainer = self._emotion_reward_stack(role="object")
+        samples = list(samples)
+        history = trainer.train_epochs(samples, epochs=epochs)
+        return {
+            "command": "train_object_emotion_reward",
+            "role": "object",
+            "sample_count": len(samples),
+            "epochs": int(epochs),
+            "last_result": None if not history else history[-1],
+            "history": history,
+        }
+
+    def predict_emotion(self, noun: str):
+        """Predict reward for noun's latest event, routing by whether noun is subject or object."""
+        from reward import reward_input_from_subject_event, subject_events_from_short_memory
+
+        noun = str(noun).strip().lower()
+        instance_ids = self._noun_instance_ids(noun)
+        events = subject_events_from_short_memory(self.consciousness.short_memory)
+
+        candidate_events = []
+        for event in events:
+            is_subject = (
+                event.subject_instance_id in instance_ids
+                or str(event.subject_text or "").lower() == noun
+            )
+            is_object = (
+                event.object_instance_id in instance_ids
+                or str(event.object_text or "").lower() == noun
+            )
+            if is_subject:
+                candidate_events.append((event, "subject"))
+            if is_object:
+                candidate_events.append((event, "object"))
+
+        candidate_events.sort(
+            key=lambda item: (
+                -1 if item[0].time_position is None else int(item[0].time_position),
+                -1 if item[0].subject_pair_index is None else int(item[0].subject_pair_index),
+            ),
+            reverse=True,
+        )
+
+        if not candidate_events:
+            return {
+                "command": "predict_emotion",
+                "status": "no_event",
+                "noun": noun,
+                "instance_ids": instance_ids,
+                "event_role": None,
+                "reward_score": None,
+                "reward_label": None,
+                "event": None,
+            }
+
+        latest_event, event_role = candidate_events[0]
+        _, _, engine, _ = self._emotion_reward_stack(role=event_role)
+        prediction = engine.predict(reward_input_from_subject_event(latest_event))
+
+        selected_instance_id = (
+            latest_event.subject_instance_id
+            if event_role == "subject"
+            else latest_event.object_instance_id
+        )
+        event_view = {
+            "subject_text": latest_event.subject_text,
+            "subject_instance_id": latest_event.subject_instance_id,
+            "action_text": latest_event.action_text,
+            "object_text": latest_event.object_text,
+            "object_instance_id": latest_event.object_instance_id,
+            "time_position": latest_event.time_position,
+            "subject_pair_index": latest_event.subject_pair_index,
+        }
+        return {
+            "command": "predict_emotion",
+            "status": "predicted",
+            "noun": noun,
+            "instance_ids": instance_ids,
+            "selected_instance_id": selected_instance_id,
+            "event_role": event_role,
+            "event": event_view,
+            "reward_score": prediction.score,
+            "reward_label": prediction.label,
+            "prediction": {
+                "score": prediction.score,
+                "label": prediction.label,
+                "model_role": event_role,
+                "subject_text": prediction.subject_text,
+                "action_text": prediction.action_text,
+                "object_text": prediction.object_text,
+                "subject_instance_id": prediction.subject_instance_id,
+                "object_instance_id": prediction.object_instance_id,
+            },
+        }
 
     def _write_supervised_facts_from_sentence(
         self,
@@ -122,8 +305,10 @@ class HighLevelCommands:
             "tokens": observation["tokens"],
             "action_count": observation["action_count"],
             "relation_count": observation["relation_count"],
+            "reward_count": observation.get("reward_count", 0),
             "event_entries_added": observation["event_entries_added"],
             "relation_entries_added": observation["relation_entries_added"],
+            "reward_entries_added": observation.get("reward_entries_added", 0),
             "states": observation["states"],
             "updated_instances": rebuilt_instances,
             "focus": focus,
@@ -214,7 +399,8 @@ class HighLevelCommands:
         return {
             "command": "focus_instance",
             "instance_id": instance_id,
-            "target_score": float(target_score),
+            "target_score": float(target_score),
+
             "event_count": result["event_count"],
             "relation_count": result["relation_count"],
             "focus": result["focus"],

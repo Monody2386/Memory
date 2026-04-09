@@ -25,8 +25,11 @@ class PredictedEvent:
     source_action_type: Optional[int]
     source_time_position: Optional[int]
     source_pair_index: Optional[int]
+    source_event_index: Optional[int]
     time_position: int
+    event_index: Optional[int]
     score: float
+    polarity: int = 1
 
     def as_dict(self):
         return {
@@ -39,8 +42,11 @@ class PredictedEvent:
             "source_action_type": self.source_action_type,
             "source_time_position": self.source_time_position,
             "source_pair_index": self.source_pair_index,
+            "source_event_index": self.source_event_index,
             "time_position": self.time_position,
+            "event_index": self.event_index,
             "score": self.score,
+            "polarity": self.polarity,
         }
 
 
@@ -56,7 +62,14 @@ class ActionModel(nn.Module):
             nn.Linear(hidden_dim, action_dim, bias=False),
         )
 
-    def forward(self, x):
+    def integrate_attention(self, x):
+        """Integrate short-memory events into one context vector.
+
+        Input:
+            x: event sequence shaped [batch, event_count, noun_dim + action_dim].
+        Output:
+            tensor: context vector shaped [batch, value_dim].
+        """
         input_prefix = x[:, :-1, :]
         input_suffix = x[:, -1, :]
 
@@ -68,8 +81,15 @@ class ActionModel(nn.Module):
         attention_weight = F.softmax(scores, dim=-1)
         output = torch.matmul(attention_weight, v).squeeze(1)
         output = output + self.Wv(input_suffix)
-        output = self.action_predict(output)
         return output
+
+    def predict_action_from_context(self, context):
+        """Predict the next action embedding from an integrated context vector."""
+        return self.action_predict(context)
+
+    def forward(self, x):
+        context = self.integrate_attention(x)
+        return self.predict_action_from_context(context)
 
 
 class WorldModel(nn.Module):
@@ -222,6 +242,8 @@ class WorldModel(nn.Module):
             "focus_action_type": None if focus_entry is None else focus_entry.action_type,
             "focus_time_position": None if focus_entry is None else focus_entry.time_position,
             "focus_pair_index": None if focus_entry is None else focus_entry.pair_index,
+            "focus_event_index": None if focus_entry is None else focus_entry.event_index,
+            "focus_polarity": 1 if focus_entry is None else int(getattr(focus_entry, "polarity", 1)),
             "focus_noun_instance_id": focus_noun_instance_id,
             "focus_action_instance_id": focus_action_instance_id,
         }
@@ -244,8 +266,11 @@ class WorldModel(nn.Module):
             source_action_type=prediction["focus_action_type"],
             source_time_position=prediction["focus_time_position"],
             source_pair_index=prediction["focus_pair_index"],
+            source_event_index=prediction["focus_event_index"],
             time_position=next_time_position,
+            event_index=next_time_position,
             score=float(score),
+            polarity=int(prediction.get("focus_polarity", 1)),
         )
         result = prediction.copy()
         result["predicted_event"] = predicted_event
@@ -289,10 +314,12 @@ class WorldModel(nn.Module):
             action_instance_id=event.action_instance_id,
             time_position=event.time_position,
             pair_index=pair_index,
+            event_index=event.event_index,
             noun_text=noun_text,
             action_text=action_text,
             role=role,
             pair_kind=pair_kind,
+            polarity=event.polarity,
             info_pair={
                 "pair_kind": pair_kind,
                 "noun_instance_id": event.noun_instance_id,
@@ -303,7 +330,10 @@ class WorldModel(nn.Module):
                 "source_action_type": event.source_action_type,
                 "source_time_position": event.source_time_position,
                 "source_pair_index": event.source_pair_index,
+                "source_event_index": event.source_event_index,
+                "event_index": event.event_index,
                 "role": role,
+                "polarity": event.polarity,
             },
         )
         return event

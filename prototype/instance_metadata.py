@@ -14,6 +14,8 @@ POSSESSIVE_NOUN_LIST = {
     "mine", "yours", "hers", "ours", "theirs",
 }
 
+ARTICLE_LIST = {"a", "an", "the"}
+
 INSTANCE_SCOPE_WORLD = "world"
 INSTANCE_SCOPE_SCENE = "scene"
 VALID_INSTANCE_SCOPES = {INSTANCE_SCOPE_WORLD, INSTANCE_SCOPE_SCENE}
