@@ -61,6 +61,7 @@ class RewardMemoryEntry:
     pair_index: int
     subject_text: str
     subject_instance_id: str
+    polarity: int = 1
     action_text: Optional[str] = None
     object_text: Optional[str] = None
     object_instance_id: Optional[str] = None
@@ -813,6 +814,7 @@ class ShortMemory:
         action_text: Optional[str] = None,
         object_text: Optional[str] = None,
         object_instance_id: Optional[str] = None,
+        polarity: int = 1,
         score: float = 1.0,
         time_position: int = 0,
         pair_index: Optional[int] = None,
@@ -827,6 +829,7 @@ class ShortMemory:
             "subject_instance_id": subject_instance_id,
             "reward_word": reward_word,
             "reward_value": float(reward_value),
+            "polarity": int(polarity),
             "action_text": action_text,
             "object_text": object_text,
             "object_instance_id": object_instance_id,
@@ -844,6 +847,7 @@ class ShortMemory:
             pair_index=int(pair_index),
             subject_text=subject_text,
             subject_instance_id=subject_instance_id,
+            polarity=int(polarity),
             action_text=action_text,
             object_text=object_text,
             object_instance_id=object_instance_id,
@@ -1226,12 +1230,13 @@ class ShortMemory:
                 "subject_instance_id": entry.subject_instance_id,
                 "reward_word": entry.reward_word,
                 "reward_value": entry.reward_value,
+                "polarity": entry.polarity,
                 "action_text": entry.action_text,
                 "object_text": entry.object_text,
                 "object_instance_id": entry.object_instance_id,
                 "time_position": entry.time_position,
                 "pair_index": entry.pair_index,
-                "event_index": entry.event_index,
+                "event_index": getattr(entry, "event_index", None),
                 "score": entry.score,
             }
             for entry in entries

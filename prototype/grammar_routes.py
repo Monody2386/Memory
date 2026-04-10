@@ -74,6 +74,24 @@ DEFAULT_EXTRACTOR_ROUTES = (
         match_mode="exact",
     ),
     ExtractorRoute(
+        pattern_name="negative_noun_reward_action_object",
+        structure=("noun", "negative", "reward", "action", "noun"),
+        extractor_name="_extract_pattern_negative_reward_sentence",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
+        pattern_name="negative_noun_reward_action",
+        structure=("noun", "negative", "reward", "action"),
+        extractor_name="_extract_pattern_negative_reward_sentence",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
+        pattern_name="negative_noun_reward_noun",
+        structure=("noun", "negative", "reward", "noun"),
+        extractor_name="_extract_pattern_negative_reward_sentence",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
         pattern_name="noun_reward_action_object",
         structure=("noun", "reward", "action", "noun"),
         extractor_name="_extract_pattern_reward_sentence",

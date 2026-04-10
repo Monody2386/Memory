@@ -519,6 +519,202 @@ class HighLevelCommands:
             "questions": questions,
         }
 
+    def accept(
+        self,
+        *,
+        time_position: Optional[int] = None,
+        order_by: str = "time",
+        include_rewards: bool = True,
+        save: bool = True,
+    ):
+        """Accept the current time step by checking short memory against long-term memory.
+
+        Input:
+            time_position: optional explicit time step; defaults to the current focus time.
+            order_by: time or attention ordering used when scanning short memory.
+            include_rewards: whether reward entries should be included in the scan.
+            save: whether automatic noun-noun relation writes should be persisted.
+        Output:
+            dict: current-step evidence, automatic writes, and unresolved issue records.
+        """
+        event_entries = self.consciousness.inspect_memory(kind="event", order_by=order_by)
+        relation_entries = self.consciousness.inspect_memory(kind="relation", order_by=order_by)
+        reward_entries = self.consciousness.inspect_memory(kind="reward", order_by=order_by) if include_rewards else []
+
+        if time_position is None:
+            focus = self.consciousness.inspect_focus()
+            if focus is not None:
+                time_position = int(focus["time_position"])
+            else:
+                all_entries = list(event_entries) + list(relation_entries) + list(reward_entries)
+                time_position = max((int(entry["time_position"]) for entry in all_entries), default=None)
+
+        if time_position is None:
+            return {
+                "command": "accept",
+                "status": "empty",
+                "time_position": None,
+                "evidence": {"event": [], "relation": [], "reward": []},
+                "accepted_write_count": 0,
+                "accepted_writes": [],
+                "issue_count": 0,
+                "issues": [],
+            }
+
+        current_events = [
+            entry for entry in event_entries
+            if int(entry.get("time_position", -1)) == int(time_position)
+        ]
+        current_relations = [
+            entry for entry in relation_entries
+            if int(entry.get("time_position", -1)) == int(time_position)
+        ]
+        current_rewards = [
+            entry for entry in reward_entries
+            if int(entry.get("time_position", -1)) == int(time_position)
+        ]
+
+        issues = []
+        accepted_writes = []
+        seen_keys = set()
+
+        for entry in current_relations:
+            relation_kind = entry["pair_kind"]
+            relation_name = entry["relation_name"]
+            source_text = entry.get("source_text")
+            target_text = entry.get("target_text")
+            if not source_text or not target_text:
+                continue
+
+            relation_type = self.consciousness.resolve_relation_type(relation_kind, relation_name)
+            stored_value = self.consciousness.recall_relation_value(
+                relation_kind,
+                source_text,
+                target_text,
+            )
+            if stored_value == relation_type:
+                continue
+
+            issue_type = "blank" if stored_value in {0, None} else "conflict"
+            if issue_type == "blank" and relation_kind == "noun_noun_relation" and relation_type is not None:
+                key = ("accepted", relation_kind, source_text, relation_name, target_text)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                accepted_writes.append(
+                    {
+                        "kind": relation_kind,
+                        "issue_type": issue_type,
+                        "source_noun": source_text,
+                        "target": target_text,
+                        "relation_name": relation_name,
+                        "relation_type": relation_type,
+                        "stored_value": stored_value,
+                        "result": self.consciousness.remember_noun_relation(
+                            source_text,
+                            target_text,
+                            int(relation_type),
+                            save=save,
+                        ),
+                        "memory_entry": entry,
+                    }
+                )
+                continue
+
+            key = (issue_type, relation_kind, source_text, relation_name, target_text)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            issues.append(
+                {
+                    "kind": relation_kind,
+                    "issue_type": issue_type,
+                    "source_noun": source_text,
+                    "target": target_text,
+                    "relation_name": relation_name,
+                    "relation_type": relation_type,
+                    "stored_value": stored_value,
+                    "memory_entry": entry,
+                }
+            )
+
+        for entry in current_events:
+            noun_text = entry.get("noun_text")
+            action_text = entry.get("action_text")
+            if not noun_text or not action_text:
+                continue
+
+            recall = self.consciousness.recall_noun_action(noun=noun_text, action=action_text)
+            stored_value = 0 if not recall else int(recall[0]["value"])
+            if stored_value == 1:
+                continue
+
+            key = ("blank", "noun_action_relation", noun_text, action_text)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            issues.append(
+                {
+                    "kind": "noun_action_relation",
+                    "issue_type": "blank",
+                    "source_noun": noun_text,
+                    "target": action_text,
+                    "relation_name": "noun_action",
+                    "relation_type": None,
+                    "stored_value": stored_value,
+                    "memory_entry": entry,
+                }
+            )
+
+        for entry in current_rewards:
+            subject_text = entry.get("subject_text")
+            reward_word = entry.get("reward_word")
+            if not subject_text or not reward_word:
+                continue
+
+            key = (
+                "blank",
+                "subject_event_reward",
+                subject_text,
+                entry.get("action_text"),
+                entry.get("object_text"),
+                float(entry.get("reward_value", 0.0)),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            issues.append(
+                {
+                    "kind": "subject_event_reward",
+                    "issue_type": "blank",
+                    "source_noun": subject_text,
+                    "target": entry.get("object_text") or entry.get("action_text"),
+                    "relation_name": "reward",
+                    "relation_type": None,
+                    "stored_value": None,
+                    "memory_entry": entry,
+                }
+            )
+
+        status = "accepted" if not issues else "needs_review"
+        return {
+            "command": "accept",
+            "status": status,
+            "time_position": int(time_position),
+            "evidence": {
+                "event": current_events,
+                "relation": current_relations,
+                "reward": current_rewards,
+            },
+            "accepted_write_count": len(accepted_writes),
+            "accepted_writes": accepted_writes,
+            "issue_count": len(issues),
+            "issues": issues,
+        }
+
 
     def answer_memory_question(
         self,
@@ -572,6 +768,8 @@ class HighLevelCommands:
                 question["target"],
                 save=save,
             )
+        elif kind == "subject_event_reward":
+            result = self.train_emotion_reward(epochs=1)
         else:
             raise ValueError("Unsupported memory question kind")
 

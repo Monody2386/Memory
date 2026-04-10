@@ -79,6 +79,7 @@ class RewardTuple:
     subject_instance_id: Optional[str] = None
     object_instance_id: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
+    polarity: int = 1
 
 
 @dataclass
@@ -221,6 +222,11 @@ REWARD_WORD_VALUE_MAP = {
     "like": 60.0,
     "love": 100.0,
 }
+NEGATED_REWARD_SCALE = -0.5
+
+
+def negate_reward_value(value: float) -> float:
+    return float(value) * NEGATED_REWARD_SCALE
 
 
 # ===========================================================================
@@ -1329,6 +1335,7 @@ def _extract_pattern_reward_sentence(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
     *,
+    polarity: int = 1,
     adjective_relation_types=None,
     infer_missing: bool = True,
     instance_context=None,
@@ -1344,6 +1351,8 @@ def _extract_pattern_reward_sentence(
     reward_value = REWARD_WORD_VALUE_MAP.get(reward_word)
     if reward_value is None:
         raise ValueError(f"Unknown reward word: {reward_word}")
+    if int(polarity) == -1:
+        reward_value = negate_reward_value(reward_value)
 
     action_text = None
     object_text = None
@@ -1365,7 +1374,7 @@ def _extract_pattern_reward_sentence(
         tokens=list(tokens),
         tagged_tokens=list(tagged_tokens),
         structure=tuple(tag.pos for tag in tagged_tokens),
-        pattern_name="noun_reward",
+        pattern_name="noun_reward" if int(polarity) == 1 else "negative_noun_reward",
         sentence_type="reward_sentence",
         reward_tuples=[
             RewardTuple(
@@ -1377,9 +1386,41 @@ def _extract_pattern_reward_sentence(
                 subject_instance_id=subject_instance_id,
                 object_instance_id=object_instance_id,
                 source_tokens=list(tokens),
+                polarity=int(polarity),
             )
         ],
     )
+
+
+def _extract_pattern_negative_reward_sentence(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    if len(tokens) not in {4, 5}:
+        raise ValueError("negative reward sentence requires noun + negative + reward + action/noun")
+    reduced_tokens = [tokens[0], *tokens[2:]]
+    reduced_tags = [tagged_tokens[0], *tagged_tokens[2:]]
+    parsed = _extract_pattern_reward_sentence(
+        reduced_tokens,
+        reduced_tags,
+        polarity=-1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.tokens = list(tokens)
+    parsed.tagged_tokens = list(tagged_tokens)
+    parsed.structure = tuple(tag.pos for tag in tagged_tokens)
+    for reward_tuple in parsed.reward_tuples:
+        reward_tuple.source_tokens = list(tokens)
+        reward_tuple.polarity = -1
+    return parsed
 
 
 def _extract_pattern_intransitive_action(
@@ -1968,6 +2009,7 @@ def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken
         "_extract_pattern_be_noun": _extract_pattern_be_noun,
         "_extract_pattern_negative_be_noun": _extract_pattern_negative_be_noun,
         "_extract_pattern_reward_sentence": _extract_pattern_reward_sentence,
+        "_extract_pattern_negative_reward_sentence": _extract_pattern_negative_reward_sentence,
         "_extract_pattern_intransitive_action": _extract_pattern_intransitive_action,
         "_extract_pattern_action_with_object": _extract_pattern_action_with_object,
         "_extract_pattern_negative_intransitive_action": _extract_pattern_negative_intransitive_action,
@@ -2281,6 +2323,7 @@ def resolve_instances_for_parsed_sentence(
                 subject_instance_id=subject_instance_id,
                 object_instance_id=object_instance_id,
                 source_tokens=list(reward_tuple.source_tokens),
+                polarity=reward_tuple.polarity,
             )
         )
 
@@ -2749,6 +2792,7 @@ def append_sentence_to_short_memory(
             action_text=reward_tuple.action,
             object_text=reward_tuple.object,
             object_instance_id=object_instance_id,
+            polarity=reward_tuple.polarity,
             score=base_score,
             time_position=int(resolved_time_position),
             pair_index=pair_index,
@@ -2758,6 +2802,7 @@ def append_sentence_to_short_memory(
                 "subject_instance_id": subject_instance_id,
                 "reward_word": reward_tuple.reward_word,
                 "reward_value": reward_tuple.reward_value,
+                "polarity": reward_tuple.polarity,
                 "action": reward_tuple.action,
                 "object": reward_tuple.object,
                 "object_instance_id": object_instance_id,
