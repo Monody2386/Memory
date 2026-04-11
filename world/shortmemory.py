@@ -26,6 +26,10 @@ class EventMemoryEntry:
     action_text: Optional[str] = None
     role: Optional[str] = None
     polarity: int = 1
+    accept_label: str = "none"
+    diff_value: Any = "none"
+    question_label: str = "none"
+    sentence_label: str = "none"
     pair_kind: str = "noun_action"
     adjectives: List[str] = field(default_factory=list)
     info_pair: Dict[str, Any] = field(default_factory=dict)
@@ -47,6 +51,10 @@ class RelationMemoryEntry:
     source_instance_id: Optional[str] = None
     target_instance_id: Optional[str] = None
     polarity: int = 1
+    accept_label: str = "none"
+    diff_value: Any = "none"
+    question_label: str = "none"
+    sentence_label: str = "none"
     source_type: Optional[int] = None
     target_type: Optional[int] = None
     info_pair: Dict[str, Any] = field(default_factory=dict)
@@ -61,10 +69,34 @@ class RewardMemoryEntry:
     pair_index: int
     subject_text: str
     subject_instance_id: str
-    polarity: int = 1
     action_text: Optional[str] = None
     object_text: Optional[str] = None
     object_instance_id: Optional[str] = None
+    polarity: int = 1
+    accept_label: str = "none"
+    diff_value: Any = "none"
+    question_label: str = "none"
+    sentence_label: str = "none"
+    info_pair: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SurpriseMemoryEntry:
+    score: float
+    surprise_word: str
+    surprise_value: float
+    time_position: int
+    pair_index: int
+    subject_text: str
+    subject_instance_id: str
+    action_text: Optional[str] = None
+    object_text: Optional[str] = None
+    object_instance_id: Optional[str] = None
+    polarity: int = 1
+    accept_label: str = "none"
+    diff_value: Any = "none"
+    question_label: str = "none"
+    sentence_label: str = "none"
     info_pair: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -96,6 +128,7 @@ class ShortMemory:
         self.event_entries: List[EventMemoryEntry] = []
         self.relation_entries: List[RelationMemoryEntry] = []
         self.reward_entries: List[RewardMemoryEntry] = []
+        self.surprise_entries: List[SurpriseMemoryEntry] = []
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_instance_metadata: Dict[str, Dict[str, Any]] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
@@ -103,6 +136,12 @@ class ShortMemory:
         self.adj_relation_memory: Dict[str, torch.Tensor] = {}
         self._insert_counter = 0
         self._event_counter = 0
+        self._sentence_counter = 0
+
+    def next_sentence_label(self) -> str:
+        sentence_label = f"sentence:{self._sentence_counter}"
+        self._sentence_counter += 1
+        return sentence_label
 
     def next_event_index(self) -> int:
         event_index = int(self._event_counter)
@@ -125,8 +164,15 @@ class ShortMemory:
     def short_memory_reward(self) -> List[RewardMemoryEntry]:
         return self.reward_entries
 
+    @property
+    def short_memory_surprise(self) -> List[SurpriseMemoryEntry]:
+        return self.surprise_entries
+
     def reward_list(self) -> List[RewardMemoryEntry]:
         return list(self.reward_entries)
+
+    def surprise_list(self) -> List[SurpriseMemoryEntry]:
+        return list(self.surprise_entries)
 
     def _resolve_state_dim(self, noun_embedding: torch.Tensor, action_embedding: torch.Tensor) -> int:
         candidate_dim = noun_embedding.view(-1).numel() + action_embedding.view(-1).numel()
@@ -218,6 +264,12 @@ class ShortMemory:
         referenced_nouns.update(
             entry.object_instance_id for entry in self.reward_entries if entry.object_instance_id is not None
         )
+        referenced_nouns.update(
+            entry.subject_instance_id for entry in self.surprise_entries if entry.subject_instance_id is not None
+        )
+        referenced_nouns.update(
+            entry.object_instance_id for entry in self.surprise_entries if entry.object_instance_id is not None
+        )
         referenced_actions = {
             entry.action_instance_id for entry in self.event_entries if entry.action_instance_id is not None
         }
@@ -238,6 +290,8 @@ class ShortMemory:
             self.relation_entries.pop(0)
         while len(self.reward_entries) > self.maxlen:
             self.reward_entries.pop(0)
+        while len(self.surprise_entries) > self.maxlen:
+            self.surprise_entries.pop(0)
         self._prune_instance_stores()
 
     def _default_noun_instance_id(self, noun_type=None) -> str:
@@ -661,6 +715,10 @@ class ShortMemory:
         action_instance_id: Optional[str] = None,
         role: Optional[str] = None,
         polarity: int = 1,
+        accept_label: str = "none",
+        diff_value: Any = "none",
+        question_label: str = "none",
+        sentence_label: str = "none",
         adjectives: Optional[List[str]] = None,
         pair_kind: str = "noun_action",
         info_pair: Optional[Dict[str, Any]] = None,
@@ -691,6 +749,10 @@ class ShortMemory:
             "event_index": None if event_index is None else int(event_index),
         }
         base_info_pair["polarity"] = int(polarity)
+        base_info_pair["accept_label"] = str(accept_label)
+        base_info_pair["diff_value"] = diff_value
+        base_info_pair["question_label"] = str(question_label)
+        base_info_pair["sentence_label"] = str(sentence_label)
         if role is not None:
             base_info_pair["role"] = role
         if info_pair:
@@ -709,6 +771,10 @@ class ShortMemory:
             action_text=action_text,
             role=role,
             polarity=int(polarity),
+            accept_label=str(accept_label),
+            diff_value=diff_value,
+            question_label=str(question_label),
+            sentence_label=str(sentence_label),
             pair_kind=pair_kind,
             adjectives=list(adjectives or []),
             info_pair=base_info_pair,
@@ -733,6 +799,10 @@ class ShortMemory:
         source_type: Optional[int] = None,
         target_type: Optional[int] = None,
         polarity: int = 1,
+        accept_label: str = "none",
+        diff_value: Any = "none",
+        question_label: str = "none",
+        sentence_label: str = "none",
         source_embedding: Optional[torch.Tensor] = None,
         target_embedding: Optional[torch.Tensor] = None,
         info_pair: Optional[Dict[str, Any]] = None,
@@ -770,6 +840,11 @@ class ShortMemory:
             "target_type": target_type,
             "time_position": int(time_position),
             "pair_index": int(pair_index),
+            "polarity": int(polarity),
+            "accept_label": str(accept_label),
+            "diff_value": diff_value,
+            "question_label": str(question_label),
+            "sentence_label": str(sentence_label),
         }
         if info_pair:
             base_info_pair.update(dict(info_pair))
@@ -785,6 +860,10 @@ class ShortMemory:
             source_instance_id=source_instance_id,
             target_instance_id=target_instance_id,
             polarity=int(polarity),
+            accept_label=str(accept_label),
+            diff_value=diff_value,
+            question_label=str(question_label),
+            sentence_label=str(sentence_label),
             source_type=None if source_type is None else int(source_type),
             target_type=None if target_type is None else int(target_type),
             info_pair=base_info_pair,
@@ -814,10 +893,14 @@ class ShortMemory:
         action_text: Optional[str] = None,
         object_text: Optional[str] = None,
         object_instance_id: Optional[str] = None,
-        polarity: int = 1,
         score: float = 1.0,
         time_position: int = 0,
         pair_index: Optional[int] = None,
+        polarity: int = 1,
+        accept_label: str = "none",
+        diff_value: Any = "none",
+        question_label: str = "none",
+        sentence_label: str = "none",
         info_pair: Optional[Dict[str, Any]] = None,
     ):
         if pair_index is None:
@@ -835,6 +918,11 @@ class ShortMemory:
             "object_instance_id": object_instance_id,
             "time_position": int(time_position),
             "pair_index": int(pair_index),
+            "polarity": int(polarity),
+            "accept_label": str(accept_label),
+            "diff_value": diff_value,
+            "question_label": str(question_label),
+            "sentence_label": str(sentence_label),
         }
         if info_pair:
             base_info_pair.update(dict(info_pair))
@@ -847,14 +935,84 @@ class ShortMemory:
             pair_index=int(pair_index),
             subject_text=subject_text,
             subject_instance_id=subject_instance_id,
-            polarity=int(polarity),
             action_text=action_text,
             object_text=object_text,
             object_instance_id=object_instance_id,
+            polarity=int(polarity),
+            accept_label=str(accept_label),
+            diff_value=diff_value,
+            question_label=str(question_label),
+            sentence_label=str(sentence_label),
             info_pair=base_info_pair,
         )
         self.reward_entries.append(entry)
         self.reward_entries.sort(key=lambda item: (item.time_position, item.pair_index))
+        self._trim()
+        return dict(entry.info_pair)
+
+    def append_surprise(
+        self,
+        *,
+        subject_text: str,
+        subject_instance_id: str,
+        surprise_word: str,
+        surprise_value: float,
+        action_text: Optional[str] = None,
+        object_text: Optional[str] = None,
+        object_instance_id: Optional[str] = None,
+        score: float = 1.0,
+        time_position: int = 0,
+        pair_index: Optional[int] = None,
+        polarity: int = 1,
+        accept_label: str = "none",
+        diff_value: Any = "none",
+        question_label: str = "none",
+        sentence_label: str = "none",
+        info_pair: Optional[Dict[str, Any]] = None,
+    ):
+        if pair_index is None:
+            pair_index = len(self.surprise_entries)
+
+        base_info_pair = {
+            "pair_kind": "subject_event_surprise",
+            "subject_text": subject_text,
+            "subject_instance_id": subject_instance_id,
+            "surprise_word": surprise_word,
+            "surprise_value": float(surprise_value),
+            "polarity": int(polarity),
+            "action_text": action_text,
+            "object_text": object_text,
+            "object_instance_id": object_instance_id,
+            "time_position": int(time_position),
+            "pair_index": int(pair_index),
+            "accept_label": str(accept_label),
+            "diff_value": diff_value,
+            "question_label": str(question_label),
+            "sentence_label": str(sentence_label),
+        }
+        if info_pair:
+            base_info_pair.update(dict(info_pair))
+
+        entry = SurpriseMemoryEntry(
+            score=float(score),
+            surprise_word=surprise_word,
+            surprise_value=float(surprise_value),
+            time_position=int(time_position),
+            pair_index=int(pair_index),
+            subject_text=subject_text,
+            subject_instance_id=subject_instance_id,
+            action_text=action_text,
+            object_text=object_text,
+            object_instance_id=object_instance_id,
+            polarity=int(polarity),
+            accept_label=str(accept_label),
+            diff_value=diff_value,
+            question_label=str(question_label),
+            sentence_label=str(sentence_label),
+            info_pair=base_info_pair,
+        )
+        self.surprise_entries.append(entry)
+        self.surprise_entries.sort(key=lambda item: (item.time_position, item.pair_index))
         self._trim()
         return dict(entry.info_pair)
 
@@ -1184,6 +1342,10 @@ class ShortMemory:
                 "score": entry.score,
                 "role": entry.role,
                 "polarity": entry.polarity,
+                "accept_label": entry.accept_label,
+                "diff_value": entry.diff_value,
+                "question_label": entry.question_label,
+                "sentence_label": entry.sentence_label,
             }
             for entry in entries
         ]
@@ -1209,6 +1371,10 @@ class ShortMemory:
                 "pair_index": entry.pair_index,
                 "score": entry.score,
                 "polarity": entry.polarity,
+                "accept_label": entry.accept_label,
+                "diff_value": entry.diff_value,
+                "question_label": entry.question_label,
+                "sentence_label": entry.sentence_label,
             }
             for entry in entries
         ]
@@ -1230,7 +1396,6 @@ class ShortMemory:
                 "subject_instance_id": entry.subject_instance_id,
                 "reward_word": entry.reward_word,
                 "reward_value": entry.reward_value,
-                "polarity": entry.polarity,
                 "action_text": entry.action_text,
                 "object_text": entry.object_text,
                 "object_instance_id": entry.object_instance_id,
@@ -1238,6 +1403,44 @@ class ShortMemory:
                 "pair_index": entry.pair_index,
                 "event_index": getattr(entry, "event_index", None),
                 "score": entry.score,
+                "polarity": entry.polarity,
+                "accept_label": entry.accept_label,
+                "diff_value": entry.diff_value,
+                "question_label": entry.question_label,
+                "sentence_label": entry.sentence_label,
+            }
+            for entry in entries
+        ]
+
+    def get_surprise_content_view(self, order_by: str = "time"):
+        if order_by == "time":
+            entries = self.surprise_entries
+        elif order_by == "attention":
+            entries = sorted(
+                self.surprise_entries,
+                key=lambda entry: (-entry.score, entry.time_position, entry.pair_index),
+            )
+        else:
+            raise ValueError("order_by must be 'time' or 'attention'")
+        return [
+            {
+                "pair_kind": "subject_event_surprise",
+                "subject_text": entry.subject_text,
+                "subject_instance_id": entry.subject_instance_id,
+                "surprise_word": entry.surprise_word,
+                "surprise_value": entry.surprise_value,
+                "action_text": entry.action_text,
+                "object_text": entry.object_text,
+                "object_instance_id": entry.object_instance_id,
+                "time_position": entry.time_position,
+                "pair_index": entry.pair_index,
+                "event_index": getattr(entry, "event_index", None),
+                "score": entry.score,
+                "polarity": entry.polarity,
+                "accept_label": entry.accept_label,
+                "diff_value": entry.diff_value,
+                "question_label": entry.question_label,
+                "sentence_label": entry.sentence_label,
             }
             for entry in entries
         ]
@@ -1247,6 +1450,7 @@ class ShortMemory:
             "event": self.get_event_content_view(order_by=order_by),
             "relation": self.get_relation_content_view(order_by=order_by),
             "reward": self.get_reward_content_view(order_by=order_by),
+            "surprise": self.get_surprise_content_view(order_by=order_by),
         }
 
     def latest_state(self):
@@ -1276,11 +1480,15 @@ class ShortMemory:
         self.event_entries.clear()
         self.relation_entries.clear()
         self.reward_entries.clear()
+        self.surprise_entries.clear()
         self.noun_instance_memory.clear()
         self.noun_instance_metadata.clear()
         self.action_instance_memory.clear()
         self.noun_relation_memory.clear()
         self.adj_relation_memory.clear()
+        self._insert_counter = 0
+        self._event_counter = 0
+        self._sentence_counter = 0
 
 
 ScoredTensorQueue = ShortMemory

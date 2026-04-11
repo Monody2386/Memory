@@ -141,6 +141,9 @@ class Consciousness:
             "score": float(entry.score),
             "time_position": int(entry.time_position),
             "pair_index": int(entry.pair_index),
+            "event_index": getattr(entry, "event_index", None),
+            "polarity": int(getattr(entry, "polarity", 1)),
+            "sentence_label": getattr(entry, "sentence_label", "none"),
         }
 
     def _relation_entry_to_dict(self, entry) -> dict:
@@ -156,6 +159,8 @@ class Consciousness:
             "score": float(entry.score),
             "time_position": int(entry.time_position),
             "pair_index": int(entry.pair_index),
+            "polarity": int(getattr(entry, "polarity", 1)),
+            "sentence_label": getattr(entry, "sentence_label", "none"),
         }
 
     def observe(
@@ -180,11 +185,13 @@ class Consciousness:
         before_event_count = len(self.short_memory.short_memory_event)
         before_relation_count = len(self.short_memory.short_memory_relation)
         before_reward_count = len(self.short_memory.short_memory_reward)
+        before_surprise_count = len(self.short_memory.short_memory_surprise)
         parsed = grammar.parse_sentence(
             sentence,
             adjective_relation_types=adjective_relation_types,
             short_memory=self.short_memory,
         )
+        sentence_label = self.short_memory.next_sentence_label()
         self._sync_world_model_with_actions([action_tuple.action for action_tuple in parsed.action_tuples])
         states = grammar.append_sentence_to_short_memory(
             sentence=sentence,
@@ -193,18 +200,22 @@ class Consciousness:
             time_position=time_position,
             base_score=base_score,
             adjective_relation_types=adjective_relation_types,
+            sentence_label=sentence_label,
         )
         return {
             "sentence": sentence,
+            "sentence_label": sentence_label,
             "sentence_type": parsed.sentence_type,
-            "structure": grammar.sentence_structure(sentence, short_memory=self.short_memory),
+            "structure": tuple(parsed.structure),
             "tokens": [token.text if hasattr(token, "text") else str(token) for token in parsed.tokens],
             "action_count": len(parsed.action_tuples),
             "relation_count": len(parsed.relation_tuples),
             "reward_count": len(parsed.reward_tuples),
+            "surprise_count": len(parsed.surprise_tuples),
             "event_entries_added": len(self.short_memory.short_memory_event) - before_event_count,
             "relation_entries_added": len(self.short_memory.short_memory_relation) - before_relation_count,
             "reward_entries_added": len(self.short_memory.short_memory_reward) - before_reward_count,
+            "surprise_entries_added": len(self.short_memory.short_memory_surprise) - before_surprise_count,
             "states": states,
         }
 
@@ -270,7 +281,9 @@ class Consciousness:
             return self.short_memory.get_relation_content_view(order_by=order_by)
         if kind == "reward":
             return self.short_memory.get_reward_content_view(order_by=order_by)
-        raise ValueError("kind must be one of: all/event/relation/reward")
+        if kind == "surprise":
+            return self.short_memory.get_surprise_content_view(order_by=order_by)
+        raise ValueError("kind must be one of: all/event/relation/reward/surprise")
 
     def inspect_focus(self, steps=None):
         """Return the current focus event used by the world model.
@@ -651,6 +664,10 @@ class Consciousness:
                 role=entry.role,
                 adjectives=list(entry.adjectives),
                 pair_kind=entry.pair_kind,
+                polarity=entry.polarity,
+                accept_label=entry.accept_label,
+                question_label=entry.question_label,
+                sentence_label=getattr(entry, "sentence_label", "none"),
                 info_pair=dict(entry.info_pair),
             )
         return training_memory

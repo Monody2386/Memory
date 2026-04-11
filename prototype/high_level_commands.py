@@ -19,6 +19,35 @@ class HighLevelCommands:
     _object_emotion_reward_model: Any = field(default=None, init=False, repr=False)
     _object_emotion_reward_engine: Any = field(default=None, init=False, repr=False)
     _object_emotion_reward_trainer: Any = field(default=None, init=False, repr=False)
+    _surprise_encoder: Any = field(default=None, init=False, repr=False)
+    _surprise_model: Any = field(default=None, init=False, repr=False)
+    _surprise_engine: Any = field(default=None, init=False, repr=False)
+    _surprise_trainer: Any = field(default=None, init=False, repr=False)
+
+    def _surprise_stack(self):
+        if self._surprise_engine is None:
+            from surprise import SubjectEventSurpriseEngine, SubjectEventSurpriseNet, SubjectEventSurpriseTrainer, SurpriseEncoder
+            from world.world_model import action_dim, noun_dim
+
+            self._surprise_encoder = SurpriseEncoder(self.consciousness)
+            self._surprise_model = SubjectEventSurpriseNet(
+                noun_dim=noun_dim,
+                action_dim=action_dim,
+            )
+            self._surprise_engine = SubjectEventSurpriseEngine(
+                self._surprise_model,
+                self._surprise_encoder,
+            )
+            self._surprise_trainer = SubjectEventSurpriseTrainer(
+                self._surprise_model,
+                self._surprise_encoder,
+            )
+        return (
+            self._surprise_encoder,
+            self._surprise_model,
+            self._surprise_engine,
+            self._surprise_trainer,
+        )
 
     def _emotion_reward_stack(self, role: str = "subject"):
         """Create one reward model per event role: subject actor reward or object receiver reward."""
@@ -196,6 +225,131 @@ class HighLevelCommands:
             },
         }
 
+    def _event_entry_matches(self, entry, *, noun: str, action: Optional[str]) -> bool:
+        if getattr(entry, "question_label", "none") == "question":
+            return False
+        noun_key = str(noun).strip().lower()
+        action_key = None if action is None else str(action).strip().lower()
+        if str(getattr(entry, "noun_text", "") or "").lower() != noun_key:
+            return False
+        if action_key is not None and str(getattr(entry, "action_text", "") or "").lower() != action_key:
+            return False
+        return True
+
+    def _event_group_for_entry(self, focus_entry):
+        focus_key = (getattr(focus_entry, "time_position", None), getattr(focus_entry, "event_index", None))
+        if focus_key[1] is not None:
+            return [
+                entry for entry in self.consciousness.short_memory.short_memory_event
+                if (entry.time_position, entry.event_index) == focus_key
+            ]
+        return [
+            entry for entry in self.consciousness.short_memory.short_memory_event
+            if entry.time_position == focus_key[0]
+        ]
+
+    def _subject_event_from_group(self, group):
+        from reward import SubjectEvent
+
+        subject_entries = [entry for entry in group if entry.role == "subject"]
+        object_entries = [entry for entry in group if entry.role == "object"]
+        if not subject_entries:
+            return None
+        subject_entry = sorted(subject_entries, key=lambda entry: entry.pair_index)[-1]
+        object_entry = None
+        if object_entries:
+            object_entry = sorted(object_entries, key=lambda entry: entry.pair_index)[0]
+        return SubjectEvent(
+            subject_instance_id=subject_entry.noun_instance_id,
+            subject_text=subject_entry.noun_text,
+            action_text=subject_entry.action_text,
+            object_instance_id=None if object_entry is None else object_entry.noun_instance_id,
+            object_text=None if object_entry is None else object_entry.noun_text,
+            time_position=subject_entry.time_position,
+            subject_pair_index=subject_entry.pair_index,
+            object_pair_index=None if object_entry is None else object_entry.pair_index,
+        )
+
+    def surprise_event(self, noun: str, action: Optional[str] = None):
+        """Predict surprise for the latest stored event matching noun/action."""
+        from surprise import surprise_input_from_subject_event
+
+        noun_key = str(noun).strip().lower()
+        action_key = None if action is None else str(action).strip().lower()
+        matches = [
+            entry for entry in self.consciousness.short_memory.short_memory_event
+            if self._event_entry_matches(entry, noun=noun_key, action=action_key)
+        ]
+        matches.sort(
+            key=lambda entry: (
+                -1 if entry.time_position is None else int(entry.time_position),
+                -1 if entry.event_index is None else int(entry.event_index),
+                -1 if entry.pair_index is None else int(entry.pair_index),
+            ),
+            reverse=True,
+        )
+        if not matches:
+            return {
+                "command": "surprise_event",
+                "status": "no_event",
+                "noun": noun_key,
+                "action": action_key,
+                "event": None,
+                "surprise_score": None,
+                "surprise_label": None,
+            }
+
+        focus_entry = matches[0]
+        group = self._event_group_for_entry(focus_entry)
+        event = self._subject_event_from_group(group)
+        if event is None:
+            return {
+                "command": "surprise_event",
+                "status": "no_subject_event",
+                "noun": noun_key,
+                "action": action_key,
+                "event_index": focus_entry.event_index,
+                "time_position": focus_entry.time_position,
+                "event": None,
+                "surprise_score": None,
+                "surprise_label": None,
+            }
+
+        _, _, engine, _ = self._surprise_stack()
+        prediction = engine.predict(surprise_input_from_subject_event(event))
+        event_view = {
+            "subject_text": event.subject_text,
+            "subject_instance_id": event.subject_instance_id,
+            "action_text": event.action_text,
+            "object_text": event.object_text,
+            "object_instance_id": event.object_instance_id,
+            "time_position": event.time_position,
+            "event_index": focus_entry.event_index,
+            "subject_pair_index": event.subject_pair_index,
+            "object_pair_index": event.object_pair_index,
+        }
+        return {
+            "command": "surprise_event",
+            "status": "predicted",
+            "noun": noun_key,
+            "action": action_key,
+            "matched_role": focus_entry.role,
+            "event_index": focus_entry.event_index,
+            "time_position": focus_entry.time_position,
+            "event": event_view,
+            "surprise_score": prediction.score,
+            "surprise_label": prediction.label,
+            "prediction": {
+                "score": prediction.score,
+                "label": prediction.label,
+                "subject_text": prediction.subject_text,
+                "action_text": prediction.action_text,
+                "object_text": prediction.object_text,
+                "subject_instance_id": prediction.subject_instance_id,
+                "object_instance_id": prediction.object_instance_id,
+            },
+        }
+
     def _write_supervised_facts_from_sentence(
         self,
         sentence: str,
@@ -300,15 +454,18 @@ class HighLevelCommands:
         return {
             "command": "understand",
             "sentence": sentence,
+            "sentence_label": observation.get("sentence_label"),
             "sentence_type": observation["sentence_type"],
             "structure": observation["structure"],
             "tokens": observation["tokens"],
             "action_count": observation["action_count"],
             "relation_count": observation["relation_count"],
             "reward_count": observation.get("reward_count", 0),
+            "surprise_count": observation.get("surprise_count", 0),
             "event_entries_added": observation["event_entries_added"],
             "relation_entries_added": observation["relation_entries_added"],
             "reward_entries_added": observation.get("reward_entries_added", 0),
+            "surprise_entries_added": observation.get("surprise_entries_added", 0),
             "states": observation["states"],
             "updated_instances": rebuilt_instances,
             "focus": focus,
@@ -434,149 +591,394 @@ class HighLevelCommands:
         }
 
 
-    def question(self, *, order_by: str = "time"):
-        """Scan current short memory and ask about entries that disagree with long-term memory.
+    def inf_question(self, info_pair: dict, *, reason: str = "large_diff") -> dict:
+        """Build a placeholder confirmation question for one non-question info pair."""
+        return {
+            "type": "inf_question",
+            "reason": reason,
+            "kind": info_pair.get("pair_kind"),
+            "sentence_label": info_pair.get("sentence_label"),
+            "question_label": info_pair.get("question_label", "none"),
+            "diff_value": info_pair.get("diff_value", "none"),
+            "accept_label": info_pair.get("accept_label", "none"),
+            "memory_entry": info_pair,
+        }
 
-        Input:
-            order_by: time or attention ordering used when scanning short memory.
-        Output:
-            dict: question summary containing relation/action mismatches found in memory.
+    def question(
+        self,
+        *,
+        sentence_index: Optional[int] = None,
+        sentence_label: Optional[str] = None,
+        confirm_threshold: float = 50.0,
+        yes_threshold: float = 30.0,
+        no_threshold: float = 70.0,
+        order_by: str = "time",
+        auto_accept: bool = True,
+        interact: bool = True,
+    ):
+        """Inspect one sentence's info pairs and select which pairs are confirmed yes.
+
+        question() is the filtering phase: low-diff non-question pairs become pending yes
+        confirmations, high-diff non-question pairs become inf_question items in interactive
+        mode, and question pairs are answered from |diff_value| without training.
         """
-        relation_entries = self.consciousness.inspect_memory(kind="relation", order_by=order_by)
-        event_entries = self.consciousness.inspect_memory(kind="event", order_by=order_by)
+        if sentence_label is None and sentence_index is not None:
+            sentence_label = f"sentence:{int(sentence_index)}"
+
+        memory_view = self.consciousness.inspect_memory(kind="all", order_by=order_by)
+        all_entries = []
+        for kind, entries in memory_view.items():
+            for entry in entries:
+                item = dict(entry)
+                item["memory_kind"] = kind
+                all_entries.append(item)
+
+        def _sentence_sort_key(entry: dict):
+            label = str(entry.get("sentence_label") or "none")
+            if label.startswith("sentence:"):
+                try:
+                    return (1, int(label.split(":", 1)[1]))
+                except ValueError:
+                    pass
+            return (0, int(entry.get("time_position", -1)), int(entry.get("pair_index", -1)))
+
+        if sentence_label is None:
+            labeled_entries = [entry for entry in all_entries if entry.get("sentence_label") not in {None, "none"}]
+            if labeled_entries:
+                sentence_label = str(max(labeled_entries, key=_sentence_sort_key).get("sentence_label"))
+
+        if sentence_label is None:
+            return {
+                "command": "question",
+                "status": "empty",
+                "sentence_label": None,
+                "sentence_index": sentence_index,
+                "auto_accept_result": None,
+                "inspected_pair_count": 0,
+                "question_count": 0,
+                "questions": [],
+                "answer_count": 0,
+                "answers": [],
+                "training": {"reward": None, "surprise": None},
+            }
+
+        sentence_entries = [
+            entry for entry in all_entries
+            if str(entry.get("sentence_label") or "none") == str(sentence_label)
+        ]
+
+        def _has_diff(entry: dict) -> bool:
+            diff = entry.get("diff_value", "none")
+            return diff not in {None, "none"}
+
+        auto_accept_result = None
+        if auto_accept and sentence_entries and any(not _has_diff(entry) for entry in sentence_entries):
+            auto_accept_result = self.accept(sentence_label=str(sentence_label), order_by=order_by)
+            memory_view = self.consciousness.inspect_memory(kind="all", order_by=order_by)
+            all_entries = []
+            for kind, entries in memory_view.items():
+                for entry in entries:
+                    item = dict(entry)
+                    item["memory_kind"] = kind
+                    all_entries.append(item)
+            sentence_entries = [
+                entry for entry in all_entries
+                if str(entry.get("sentence_label") or "none") == str(sentence_label)
+            ]
 
         questions = []
-        seen_keys = set()
+        answers = []
+        auto_updates = []
+        confirmed_yes = []
+        skipped_updates = []
+        training = {"instance_embedding": None}
+        threshold = float(confirm_threshold)
 
-        for entry in relation_entries:
-            relation_kind = entry["pair_kind"]
-            relation_name = entry["relation_name"]
-            source_text = entry.get("source_text")
-            target_text = entry.get("target_text")
+        def _auto_yes(entry: dict, reason: str):
+            question_item = self.inf_question(entry, reason=reason)
+            confirmed_yes.append(question_item)
+            result = {
+                "command": "question",
+                "accepted": True,
+                "action": "pending_yes_confirmation",
+                "kind": entry.get("memory_kind"),
+                "reason": reason,
+                "question": question_item,
+            }
+            auto_updates.append(result)
+            return result
 
-            if not source_text or not target_text:
+        if not bool(interact):
+            for entry in sentence_entries:
+                if not _has_diff(entry):
+                    continue
+                if str(entry.get("question_label") or "none") == "question":
+                    skipped_updates.append({
+                        "reason": "question_pair_skipped_in_non_interactive_mode",
+                        "memory_kind": entry.get("memory_kind"),
+                        "memory_entry": entry,
+                    })
+                    continue
+                diff_value = float(entry.get("diff_value"))
+                abs_diff = abs(diff_value)
+                if abs_diff <= threshold:
+                    _auto_yes(entry, reason="small_diff_auto_accept")
+                else:
+                    skipped_updates.append({
+                        "reason": "large_diff_non_interactive_skip",
+                        "diff_value": diff_value,
+                        "abs_diff_value": abs_diff,
+                        "threshold": threshold,
+                        "memory_kind": entry.get("memory_kind"),
+                        "memory_entry": entry,
+                    })
+
+            return {
+                "command": "question",
+                "status": "updated",
+                "interact": False,
+                "sentence_label": str(sentence_label),
+                "sentence_index": sentence_index,
+                "thresholds": {
+                    "confirm_threshold": float(confirm_threshold),
+                    "yes_threshold": float(yes_threshold),
+                    "no_threshold": float(no_threshold),
+                },
+                "auto_accept_result": auto_accept_result,
+                "inspected_pair_count": len(sentence_entries),
+                "question_count": 0,
+                "questions": [],
+                "answer_count": 0,
+                "answers": [],
+                "training": training,
+                "confirmed_yes_count": len(confirmed_yes),
+                "confirmed_yes": confirmed_yes,
+                "auto_update_count": len(auto_updates),
+                "auto_updates": auto_updates,
+                "skipped_update_count": len(skipped_updates),
+                "skipped_updates": skipped_updates,
+                "trained_pair_count": 0,
+                "trained_reward_count": 0,
+                "trained_surprise_count": 0,
+            }
+
+        for entry in sentence_entries:
+            if not _has_diff(entry):
+                continue
+            diff_value = float(entry.get("diff_value"))
+            abs_diff = abs(diff_value)
+            if str(entry.get("question_label") or "none") == "question":
+                if abs_diff >= float(no_threshold):
+                    answer = "NO"
+                elif abs_diff <= float(yes_threshold):
+                    answer = "YES"
+                else:
+                    answer = "UNKNOWN"
+                answers.append(
+                    {
+                        "type": "answer_question_pair",
+                        "answer": answer,
+                        "diff_value": diff_value,
+                        "abs_diff_value": abs_diff,
+                        "memory_kind": entry.get("memory_kind"),
+                        "memory_entry": entry,
+                    }
+                )
                 continue
 
-            relation_type = self.consciousness.resolve_relation_type(relation_kind, relation_name)
-            if relation_type is None:
-                continue
-
-            stored_value = self.consciousness.recall_relation_value(
-                relation_kind,
-                source_text,
-                target_text,
-            )
-            if stored_value != 0:
-                continue
-
-            key = (relation_kind, source_text, relation_name, target_text)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            questions.append(
-                {
-                    "kind": relation_kind,
-                    "prompt": f"I observed '{source_text}' with relation '{relation_name}' -> '{target_text}' in short memory, and long-term memory does not store this relation yet. Is this relation correct?",
-                    "source_noun": source_text,
-                    "target": target_text,
-                    "relation_name": relation_name,
-                    "relation_type": relation_type,
-                    "existing_memory": [],
-                    "memory_entry": entry,
-                }
-            )
-
-        for entry in event_entries:
-            noun_text = entry.get("noun_text")
-            action_text = entry.get("action_text")
-            if not noun_text or not action_text:
-                continue
-            recall = self.consciousness.recall_noun_action(noun=noun_text, action=action_text)
-            stored_value = 0 if not recall else int(recall[0]["value"])
-            if stored_value != 0:
-                continue
-            key = ("noun_action_relation", noun_text, action_text)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            questions.append(
-                {
-                    "kind": "noun_action_relation",
-                    "prompt": f"I observed the event '{noun_text} -> {action_text}' in short memory, and long-term memory does not store this noun-action relation yet. Should it be remembered?",
-                    "source_noun": noun_text,
-                    "target": action_text,
-                    "relation_name": "noun_action",
-                    "relation_type": None,
-                    "existing_memory": [],
-                    "memory_entry": entry,
-                }
-            )
+            if abs_diff <= threshold:
+                _auto_yes(entry, reason="small_diff_auto_accept")
+            else:
+                questions.append(self.inf_question(entry, reason="large_diff"))
 
         return {
             "command": "question",
-            "order_by": order_by,
+            "status": "ok",
+            "interact": True,
+            "sentence_label": str(sentence_label),
+            "sentence_index": sentence_index,
+            "thresholds": {
+                "confirm_threshold": float(confirm_threshold),
+                "yes_threshold": float(yes_threshold),
+                "no_threshold": float(no_threshold),
+            },
+            "auto_accept_result": auto_accept_result,
+            "inspected_pair_count": len(sentence_entries),
             "question_count": len(questions),
             "questions": questions,
+            "answer_count": len(answers),
+            "answers": answers,
+            "confirmed_yes_count": len(confirmed_yes),
+            "confirmed_yes": confirmed_yes,
+            "auto_update_count": len(auto_updates),
+            "auto_updates": auto_updates,
+            "skipped_update_count": len(skipped_updates),
+            "skipped_updates": skipped_updates,
+            "training": training,
         }
 
     def accept(
         self,
         *,
+        sentence_label: Optional[str] = None,
         time_position: Optional[int] = None,
+        event_index: Optional[int] = None,
         order_by: str = "time",
         include_rewards: bool = True,
         save: bool = True,
     ):
-        """Accept the current time step by checking short memory against long-term memory.
+        """Evaluate all info pairs from one sentence.
 
-        Input:
-            time_position: optional explicit time step; defaults to the current focus time.
-            order_by: time or attention ordering used when scanning short memory.
-            include_rewards: whether reward entries should be included in the scan.
-            save: whether automatic noun-noun relation writes should be persisted.
-        Output:
-            dict: current-step evidence, automatic writes, and unresolved issue records.
+        The default scope is the latest sentence_label produced by understand(sentence).
+        Relation pairs are checked against long-term memory; reward pairs use the reward model;
+        event and surprise pairs use the surprise model. accept_label is numeric in [-100, 100]:
+        100 means same/expected, -100 means conflict, and 0 means no stored evidence or neutral.
         """
+        del save
+        from reward import SubjectEventRewardInput
+        from surprise import SubjectEventSurpriseInput
+
         event_entries = self.consciousness.inspect_memory(kind="event", order_by=order_by)
         relation_entries = self.consciousness.inspect_memory(kind="relation", order_by=order_by)
         reward_entries = self.consciousness.inspect_memory(kind="reward", order_by=order_by) if include_rewards else []
+        surprise_entries = self.consciousness.inspect_memory(kind="surprise", order_by=order_by)
+        all_entries = list(event_entries) + list(relation_entries) + list(reward_entries) + list(surprise_entries)
 
-        if time_position is None:
+        def _sentence_sort_key(entry: dict):
+            label = str(entry.get("sentence_label") or "none")
+            if label.startswith("sentence:"):
+                try:
+                    return (1, int(label.split(":", 1)[1]))
+                except ValueError:
+                    pass
+            return (0, int(entry.get("time_position", -1)), int(entry.get("pair_index", -1)))
+
+        if sentence_label is None:
+            labeled_entries = [entry for entry in all_entries if entry.get("sentence_label") not in {None, "none"}]
+            if labeled_entries:
+                sentence_label = str(max(labeled_entries, key=_sentence_sort_key).get("sentence_label"))
+
+        if time_position is None and event_index is None and sentence_label is None:
             focus = self.consciousness.inspect_focus()
             if focus is not None:
                 time_position = int(focus["time_position"])
-            else:
-                all_entries = list(event_entries) + list(relation_entries) + list(reward_entries)
+                event_index = focus.get("event_index")
+            elif all_entries:
                 time_position = max((int(entry["time_position"]) for entry in all_entries), default=None)
 
-        if time_position is None:
+        if sentence_label is None and time_position is None:
             return {
                 "command": "accept",
                 "status": "empty",
+                "sentence_label": None,
                 "time_position": None,
-                "evidence": {"event": [], "relation": [], "reward": []},
+                "event_index": None,
+                "evidence": {"event": [], "relation": [], "reward": [], "surprise": []},
+                "labeled_pair_count": 0,
+                "labeled_pairs": [],
                 "accepted_write_count": 0,
                 "accepted_writes": [],
                 "issue_count": 0,
                 "issues": [],
             }
 
-        current_events = [
-            entry for entry in event_entries
-            if int(entry.get("time_position", -1)) == int(time_position)
-        ]
-        current_relations = [
-            entry for entry in relation_entries
-            if int(entry.get("time_position", -1)) == int(time_position)
-        ]
-        current_rewards = [
-            entry for entry in reward_entries
-            if int(entry.get("time_position", -1)) == int(time_position)
-        ]
+        def _entry_in_accept_scope(entry):
+            if sentence_label is not None:
+                return str(entry.get("sentence_label") or "none") == str(sentence_label)
+            if int(entry.get("time_position", -1)) != int(time_position):
+                return False
+            if event_index is None:
+                return True
+            return entry.get("event_index") == event_index
 
+        current_events = [entry for entry in event_entries if _entry_in_accept_scope(entry)]
+        current_relations = [entry for entry in relation_entries if _entry_in_accept_scope(entry)]
+        current_rewards = [entry for entry in reward_entries if _entry_in_accept_scope(entry)]
+        current_surprises = [entry for entry in surprise_entries if _entry_in_accept_scope(entry)]
+
+        labeled_pairs = []
         issues = []
         accepted_writes = []
-        seen_keys = set()
+
+        def _relation_accept_score(stored_value, expected_value, polarity: int = 1) -> float:
+            if stored_value in {None, 0}:
+                return 0.0
+            same = stored_value == expected_value
+            if int(polarity) == -1:
+                same = not same
+            return -50.0 if same else 50.0
+
+        def _score_issue_type(score: float) -> str:
+            if score >= 0.0:
+                return "same"
+            return "conflict"
+
+        def _mark_accept_label(kind: str, entry: dict, label, diff_value="none") -> None:
+            if kind == "event":
+                entries = self.consciousness.short_memory.short_memory_event
+            elif kind == "relation":
+                entries = self.consciousness.short_memory.short_memory_relation
+            elif kind == "reward":
+                entries = self.consciousness.short_memory.short_memory_reward
+            elif kind == "surprise":
+                entries = self.consciousness.short_memory.short_memory_surprise
+            else:
+                return
+
+            label_value = float(label)
+            for memory_entry in entries:
+                if str(getattr(memory_entry, "sentence_label", "none")) != str(entry.get("sentence_label", "none")):
+                    continue
+                if int(getattr(memory_entry, "time_position", -1)) != int(entry.get("time_position", -1)):
+                    continue
+                if int(getattr(memory_entry, "pair_index", -1)) != int(entry.get("pair_index", -1)):
+                    continue
+                if kind == "event" and getattr(memory_entry, "event_index", None) != entry.get("event_index"):
+                    continue
+                setattr(memory_entry, "accept_label", label_value)
+                setattr(memory_entry, "diff_value", diff_value)
+                memory_entry.info_pair["accept_label"] = label_value
+                memory_entry.info_pair["diff_value"] = diff_value
+                entry["accept_label"] = label_value
+                entry["diff_value"] = diff_value
+                return
+
+        def _predict_instance_relation(entry: dict):
+            source_instance_id = entry.get("source_instance_id")
+            if source_instance_id is None:
+                return None
+
+            relation_kind = entry.get("pair_kind")
+            relation_name = entry.get("relation_name")
+            source_embedding = self.consciousness.short_memory.get_noun_embedding(source_instance_id)
+            relation_weight = self.consciousness.short_memory.ensure_relation_clone(relation_kind, relation_name)
+            if source_embedding is None or relation_weight is None:
+                return None
+
+            rm, arm, kt = self.consciousness.short_memory._load_language_context()
+            predicted_target = relation_weight @ source_embedding.to(relation_weight.device).view(-1)
+            if relation_kind == "noun_noun_relation":
+                top_indices, top_scores = kt.knowledge_map_one.query_similarity(predicted_target.detach().cpu(), top_k=1)
+                predicted_index = int(top_indices.view(-1)[0].item())
+                predicted_text = rm.noun_list[predicted_index] if predicted_index < len(rm.noun_list) else None
+            elif relation_kind == "adj_noun_relation":
+                top_indices, top_scores = kt.adj_map_one.query_adjective_similarity(predicted_target.detach().cpu(), top_k=1)
+                predicted_index = int(top_indices.view(-1)[0].item())
+                predicted_text = arm.adjective_list[predicted_index] if predicted_index < len(arm.adjective_list) else None
+            else:
+                return None
+
+            score = float(top_scores.view(-1)[0].item())
+            target_text = str(entry.get("target_text") or "").lower()
+            same = predicted_text is not None and str(predicted_text).lower() == target_text
+            if int(entry.get("polarity", 1)) == -1:
+                same = not same
+            return {
+                "stored_value": predicted_text,
+                "prediction_score": score,
+                "accept_label": -50.0 if same else 50.0,
+                "method": "instance_relation_prediction",
+            }
 
         for entry in current_relations:
             relation_kind = entry["pair_kind"]
@@ -587,134 +989,742 @@ class HighLevelCommands:
                 continue
 
             relation_type = self.consciousness.resolve_relation_type(relation_kind, relation_name)
-            stored_value = self.consciousness.recall_relation_value(
-                relation_kind,
-                source_text,
-                target_text,
-            )
-            if stored_value == relation_type:
-                continue
-
-            issue_type = "blank" if stored_value in {0, None} else "conflict"
-            if issue_type == "blank" and relation_kind == "noun_noun_relation" and relation_type is not None:
-                key = ("accepted", relation_kind, source_text, relation_name, target_text)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                accepted_writes.append(
-                    {
-                        "kind": relation_kind,
-                        "issue_type": issue_type,
-                        "source_noun": source_text,
-                        "target": target_text,
-                        "relation_name": relation_name,
-                        "relation_type": relation_type,
-                        "stored_value": stored_value,
-                        "result": self.consciousness.remember_noun_relation(
-                            source_text,
-                            target_text,
-                            int(relation_type),
-                            save=save,
-                        ),
-                        "memory_entry": entry,
-                    }
+            relation_polarity = int(entry.get("polarity", 1))
+            instance_prediction = _predict_instance_relation(entry)
+            if instance_prediction is not None:
+                stored_value = instance_prediction["stored_value"]
+                label = instance_prediction["accept_label"]
+                accept_method = instance_prediction["method"]
+                prediction_score = instance_prediction["prediction_score"]
+            else:
+                stored_value = self.consciousness.recall_relation_value(
+                    relation_kind,
+                    source_text,
+                    target_text,
                 )
-                continue
+                label = _relation_accept_score(stored_value, relation_type, relation_polarity)
+                accept_method = "relation_map_lookup"
+                prediction_score = None
 
-            key = (issue_type, relation_kind, source_text, relation_name, target_text)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
+            diff_value = float(label) + 50.0
+            _mark_accept_label("relation", entry, label, diff_value)
+            pair_label = {
+                "kind": relation_kind,
+                "accept_label": label,
+                "diff_value": diff_value,
+                "source_noun": source_text,
+                "target": target_text,
+                "relation_name": relation_name,
+                "relation_type": relation_type,
+                "stored_value": stored_value,
+                "prediction_score": prediction_score,
+                "accept_method": accept_method,
+                "polarity": relation_polarity,
+                "memory_entry": entry,
+            }
+            labeled_pairs.append(pair_label)
+            if label > 0.0:
+                issues.append({**pair_label, "issue_type": "conflict"})
 
-            issues.append(
-                {
-                    "kind": relation_kind,
-                    "issue_type": issue_type,
-                    "source_noun": source_text,
-                    "target": target_text,
-                    "relation_name": relation_name,
-                    "relation_type": relation_type,
-                    "stored_value": stored_value,
-                    "memory_entry": entry,
-                }
+        def _object_for_subject(subject_entry: dict):
+            candidates = [
+                entry for entry in current_events
+                if entry.get("role") == "object"
+                and entry.get("sentence_label") == subject_entry.get("sentence_label")
+                and entry.get("time_position") == subject_entry.get("time_position")
+                and entry.get("event_index") == subject_entry.get("event_index")
+                and int(entry.get("pair_index", -1)) < int(subject_entry.get("pair_index", -1))
+            ]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda item: int(item.get("pair_index", -1)))
+
+        _, _, surprise_engine, _ = self._surprise_stack()
+        event_predictions = {}
+        for subject_entry in [entry for entry in current_events if entry.get("role") == "subject"]:
+            object_entry = _object_for_subject(subject_entry)
+            prediction = surprise_engine.predict(
+                SubjectEventSurpriseInput(
+                    subject_text=subject_entry.get("noun_text"),
+                    subject_instance_id=subject_entry.get("noun_instance_id"),
+                    action_text=subject_entry.get("action_text"),
+                    object_text=None if object_entry is None else object_entry.get("noun_text"),
+                    object_instance_id=None if object_entry is None else object_entry.get("noun_instance_id"),
+                )
             )
+            label = float(prediction.score) * int(subject_entry.get("polarity", 1))
+            event_key = (
+                subject_entry.get("sentence_label"),
+                subject_entry.get("time_position"),
+                subject_entry.get("event_index"),
+            )
+            event_predictions[event_key] = {
+                "label": max(-100.0, min(100.0, label)),
+                "prediction": prediction,
+            }
 
         for entry in current_events:
-            noun_text = entry.get("noun_text")
-            action_text = entry.get("action_text")
-            if not noun_text or not action_text:
+            event_key = (entry.get("sentence_label"), entry.get("time_position"), entry.get("event_index"))
+            prediction_info = event_predictions.get(event_key)
+            if prediction_info is None:
                 continue
+            label = prediction_info["label"]
+            diff_value = float(label)
+            _mark_accept_label("event", entry, label, diff_value)
+            pair_label = {
+                "kind": "event_surprise_estimate",
+                "accept_label": label,
+                "diff_value": diff_value,
+                "source_noun": entry.get("noun_text"),
+                "target": entry.get("action_text"),
+                "relation_name": "surprise_model",
+                "relation_type": None,
+                "stored_value": label,
+                "polarity": int(entry.get("polarity", 1)),
+                "prediction_label": prediction_info["prediction"].label,
+                "memory_entry": entry,
+            }
+            labeled_pairs.append(pair_label)
+            if label < 0.0:
+                issues.append({**pair_label, "issue_type": _score_issue_type(label)})
 
-            recall = self.consciousness.recall_noun_action(noun=noun_text, action=action_text)
-            stored_value = 0 if not recall else int(recall[0]["value"])
-            if stored_value == 1:
-                continue
-
-            key = ("blank", "noun_action_relation", noun_text, action_text)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-
-            issues.append(
-                {
-                    "kind": "noun_action_relation",
-                    "issue_type": "blank",
-                    "source_noun": noun_text,
-                    "target": action_text,
-                    "relation_name": "noun_action",
-                    "relation_type": None,
-                    "stored_value": stored_value,
-                    "memory_entry": entry,
-                }
-            )
-
+        _, _, reward_engine, _ = self._emotion_reward_stack(role="subject")
         for entry in current_rewards:
-            subject_text = entry.get("subject_text")
-            reward_word = entry.get("reward_word")
-            if not subject_text or not reward_word:
-                continue
-
-            key = (
-                "blank",
-                "subject_event_reward",
-                subject_text,
-                entry.get("action_text"),
-                entry.get("object_text"),
-                float(entry.get("reward_value", 0.0)),
+            prediction = reward_engine.predict(
+                SubjectEventRewardInput(
+                    subject_text=entry.get("subject_text"),
+                    subject_instance_id=entry.get("subject_instance_id"),
+                    action_text=entry.get("action_text"),
+                    object_text=entry.get("object_text"),
+                    object_instance_id=entry.get("object_instance_id"),
+                )
             )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
+            label = max(-100.0, min(100.0, float(prediction.score) * int(entry.get("polarity", 1))))
+            diff_value = float(entry.get("reward_value", 0.0)) - float(label)
+            _mark_accept_label("reward", entry, label, diff_value)
+            pair_label = {
+                "kind": "subject_event_reward",
+                "accept_label": label,
+                "diff_value": diff_value,
+                "source_noun": entry.get("subject_text"),
+                "target": entry.get("object_text") or entry.get("action_text"),
+                "relation_name": "reward_model",
+                "relation_type": None,
+                "stored_value": label,
+                "polarity": int(entry.get("polarity", 1)),
+                "prediction_label": prediction.label,
+                "memory_entry": entry,
+            }
+            labeled_pairs.append(pair_label)
+            if label < 0.0:
+                issues.append({**pair_label, "issue_type": _score_issue_type(label)})
 
-            issues.append(
-                {
-                    "kind": "subject_event_reward",
-                    "issue_type": "blank",
-                    "source_noun": subject_text,
-                    "target": entry.get("object_text") or entry.get("action_text"),
-                    "relation_name": "reward",
-                    "relation_type": None,
-                    "stored_value": None,
-                    "memory_entry": entry,
-                }
+        for entry in current_surprises:
+            prediction = surprise_engine.predict(
+                SubjectEventSurpriseInput(
+                    subject_text=entry.get("subject_text"),
+                    subject_instance_id=entry.get("subject_instance_id"),
+                    action_text=entry.get("action_text"),
+                    object_text=entry.get("object_text"),
+                    object_instance_id=entry.get("object_instance_id"),
+                )
             )
+            label = max(-100.0, min(100.0, float(prediction.score) * int(entry.get("polarity", 1))))
+            diff_value = float(entry.get("surprise_value", 0.0)) - float(label)
+            _mark_accept_label("surprise", entry, label, diff_value)
+            pair_label = {
+                "kind": "subject_event_surprise",
+                "accept_label": label,
+                "diff_value": diff_value,
+                "source_noun": entry.get("subject_text"),
+                "target": entry.get("object_text") or entry.get("action_text"),
+                "relation_name": "surprise_model",
+                "relation_type": None,
+                "stored_value": label,
+                "polarity": int(entry.get("polarity", 1)),
+                "prediction_label": prediction.label,
+                "memory_entry": entry,
+            }
+            labeled_pairs.append(pair_label)
+            if label < 0.0:
+                issues.append({**pair_label, "issue_type": _score_issue_type(label)})
 
         status = "accepted" if not issues else "needs_review"
         return {
             "command": "accept",
             "status": status,
-            "time_position": int(time_position),
+            "sentence_label": sentence_label,
+            "time_position": None if time_position is None else int(time_position),
+            "event_index": event_index,
             "evidence": {
                 "event": current_events,
                 "relation": current_relations,
                 "reward": current_rewards,
+                "surprise": current_surprises,
             },
+            "labeled_pair_count": len(labeled_pairs),
+            "labeled_pairs": labeled_pairs,
             "accepted_write_count": len(accepted_writes),
             "accepted_writes": accepted_writes,
             "issue_count": len(issues),
             "issues": issues,
         }
 
+
+    def _memory_entry_matches(self, memory_entry, entry: dict, kind: str) -> bool:
+        if str(getattr(memory_entry, "sentence_label", "none")) != str(entry.get("sentence_label", "none")):
+            return False
+        if int(getattr(memory_entry, "time_position", -1)) != int(entry.get("time_position", -1)):
+            return False
+        if int(getattr(memory_entry, "pair_index", -1)) != int(entry.get("pair_index", -1)):
+            return False
+        if kind == "event" and getattr(memory_entry, "event_index", None) != entry.get("event_index"):
+            return False
+        return True
+
+    def _remove_short_memory_entry(self, entry: dict) -> dict:
+        kind = str(entry.get("memory_kind") or "")
+        memory = self.consciousness.short_memory
+        stores = {
+            "event": memory.short_memory_event,
+            "relation": memory.short_memory_relation,
+            "reward": memory.short_memory_reward,
+            "surprise": memory.short_memory_surprise,
+        }
+        store = stores.get(kind)
+        if store is None:
+            return {"removed": False, "reason": f"unsupported_memory_kind:{kind}"}
+
+        removed = []
+        for index in range(len(store) - 1, -1, -1):
+            if self._memory_entry_matches(store[index], entry, kind):
+                removed.append(dict(getattr(store[index], "info_pair", {}) or {}))
+                del store[index]
+
+        prune = getattr(memory, "_prune_instance_stores", None)
+        if callable(prune):
+            prune()
+        return {
+            "removed": bool(removed),
+            "removed_count": len(removed),
+            "removed_entries": list(reversed(removed)),
+        }
+
+    def _event_surprise_sample_from_entry(self, entry: dict, *, surprise_value: float, weight: float):
+        from surprise import SubjectEventSurpriseSample
+
+        memory = self.consciousness.short_memory
+        event_key = (
+            str(entry.get("sentence_label") or "none"),
+            int(entry.get("time_position", -1)),
+            entry.get("event_index"),
+        )
+        group = [
+            item for item in memory.short_memory_event
+            if (
+                str(getattr(item, "sentence_label", "none")),
+                int(getattr(item, "time_position", -1)),
+                getattr(item, "event_index", None),
+            ) == event_key
+        ]
+        subject_entry = next((item for item in group if getattr(item, "role", None) == "subject"), None)
+        object_entry = next((item for item in group if getattr(item, "role", None) == "object"), None)
+        if subject_entry is None:
+            return None
+        return SubjectEventSurpriseSample(
+            subject_text=subject_entry.noun_text,
+            action_text=subject_entry.action_text,
+            object_text=None if object_entry is None else object_entry.noun_text,
+            subject_instance_id=subject_entry.noun_instance_id,
+            object_instance_id=None if object_entry is None else object_entry.noun_instance_id,
+            surprise_value=float(surprise_value),
+            weight=float(weight),
+            source="answer_inf_question_event_confirmed",
+        )
+
+    def _confirmed_entry_from_item(self, item: dict) -> dict:
+        if "memory_entry" in item:
+            return dict(item["memory_entry"])
+        if "question" in item and isinstance(item["question"], dict):
+            question = item["question"]
+            if "memory_entry" in question:
+                return dict(question["memory_entry"])
+        return dict(item)
+
+    def _confirmed_kind(self, entry: dict) -> str:
+        kind = str(entry.get("memory_kind") or "")
+        if kind:
+            return kind
+        pair_kind = str(entry.get("pair_kind") or "")
+        if pair_kind in {"noun_noun_relation", "adj_noun_relation"}:
+            return "relation"
+        if pair_kind == "subject_event_reward":
+            return "reward"
+        if pair_kind == "subject_event_surprise":
+            return "surprise"
+        return "event"
+
+    def _confirmed_instance_ids(self, entry: dict) -> list[str]:
+        kind = self._confirmed_kind(entry)
+        instance_ids = []
+        if kind == "relation":
+            if entry.get("source_instance_id") is not None:
+                instance_ids.append(entry.get("source_instance_id"))
+        elif kind == "reward":
+            if entry.get("subject_instance_id") is not None:
+                instance_ids.append(entry.get("subject_instance_id"))
+        elif kind == "surprise":
+            for key in ("subject_instance_id", "object_instance_id"):
+                if entry.get(key) is not None:
+                    instance_ids.append(entry.get(key))
+        elif kind == "event":
+            if entry.get("noun_instance_id") is not None:
+                instance_ids.append(entry.get("noun_instance_id"))
+        return list(dict.fromkeys(str(item) for item in instance_ids if item is not None))
+
+    def _entry_weight(self, entry: dict) -> float:
+        diff = entry.get("diff_value", "none")
+        try:
+            return max(1e-6, abs(float(diff)))
+        except (TypeError, ValueError):
+            try:
+                return max(1e-6, abs(float(entry.get("score", 1.0))))
+            except (TypeError, ValueError):
+                return 1.0
+
+    def _weighted_mean_torch_losses(self, losses, weights):
+        import torch
+
+        stacked = torch.stack(losses)
+        weight_tensor = torch.tensor(
+            [max(0.0, float(weight)) for weight in weights],
+            dtype=stacked.dtype,
+            device=stacked.device,
+        )
+        if float(weight_tensor.sum().item()) <= 1e-6:
+            return stacked.mean()
+        return (stacked * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
+
+    def _loss_for_confirmed_relation_entry(self, entry: dict, instance_id: str, trainable_embedding, rm, arm, kt):
+        import torch.nn.functional as F
+
+        if str(entry.get("source_instance_id")) != str(instance_id):
+            return None
+        relation_kind = str(entry.get("pair_kind") or "")
+        relation_name = entry.get("relation_name")
+        relation_weight = self.consciousness.short_memory.ensure_relation_clone(relation_kind, relation_name)
+        if relation_weight is None:
+            return None
+        relation_weight = relation_weight.to(trainable_embedding.device)
+
+        if relation_kind == "adj_noun_relation":
+            adjective_key = str(entry.get("target_text") or "").lower()
+            if not adjective_key:
+                return None
+            if adjective_key not in arm.adjective_list:
+                arm.adjective_list.append(adjective_key)
+            adjective_idx = arm.adjective_list.index(adjective_key)
+            target_embedding = kt.adj_map_one.adjective_embedding.weight.data[adjective_idx].to(trainable_embedding.device)
+        elif relation_kind == "noun_noun_relation":
+            target_text = entry.get("target_text")
+            if not target_text:
+                return None
+            target_instance_id = entry.get("target_instance_id")
+            target_embedding = self.consciousness.short_memory.get_noun_embedding(target_instance_id)
+            if target_embedding is None:
+                _, target_embedding, _ = self.consciousness.short_memory.ensure_noun_instance(
+                    str(target_text),
+                    target_instance_id,
+                    noun_type=entry.get("target_type"),
+                )
+            target_embedding = target_embedding.to(trainable_embedding.device).detach().clone()
+        else:
+            return None
+
+        loss = F.mse_loss(relation_weight @ trainable_embedding, target_embedding)
+        if int(entry.get("polarity", 1)) == -1:
+            loss = -loss
+        return loss
+
+    def _loss_for_confirmed_reward_entry(self, entry: dict, instance_id: str, trainable_embedding, reward_model, reward_encoder):
+        import torch
+        import torch.nn.functional as F
+
+        if str(entry.get("subject_instance_id")) != str(instance_id):
+            return None
+        subject_embedding = trainable_embedding
+        action_embedding = reward_encoder.encode_action(action_text=entry.get("action_text"))
+        object_embedding = reward_encoder.encode_noun(
+            noun_text=entry.get("object_text"),
+            noun_instance_id=entry.get("object_instance_id"),
+        )
+        prediction = reward_model(
+            subject_embedding=subject_embedding,
+            action_embedding=action_embedding,
+            object_embedding=object_embedding,
+        ).view(-1)[0]
+        target = torch.tensor(float(entry.get("reward_value", 0.0)), dtype=prediction.dtype, device=prediction.device)
+        return F.smooth_l1_loss(prediction, target)
+
+    def _loss_for_confirmed_surprise_entry(self, entry: dict, instance_id: str, trainable_embedding, surprise_model, surprise_encoder):
+        import torch
+        import torch.nn.functional as F
+
+        subject_embedding = surprise_encoder.encode_noun(
+            noun_text=entry.get("subject_text"),
+            noun_instance_id=entry.get("subject_instance_id"),
+        )
+        object_embedding = surprise_encoder.encode_noun(
+            noun_text=entry.get("object_text"),
+            noun_instance_id=entry.get("object_instance_id"),
+        )
+        if str(entry.get("subject_instance_id")) == str(instance_id):
+            subject_embedding = trainable_embedding
+        elif str(entry.get("object_instance_id")) == str(instance_id):
+            object_embedding = trainable_embedding
+        else:
+            return None
+        action_embedding = surprise_encoder.encode_action(action_text=entry.get("action_text"))
+        prediction = surprise_model(
+            subject_embedding=subject_embedding,
+            action_embedding=action_embedding,
+            object_embedding=object_embedding,
+        ).view(-1)[0]
+        target = torch.tensor(float(entry.get("surprise_value", 0.0)), dtype=prediction.dtype, device=prediction.device)
+        return F.smooth_l1_loss(prediction, target)
+
+    def _value_model_samples_from_confirmed_entries(self, entries, *, event_surprise_target: float = -50.0):
+        from reward import SubjectEventRewardSample
+        from surprise import SubjectEventSurpriseSample
+
+        reward_samples = []
+        surprise_samples = []
+        for entry in entries:
+            kind = self._confirmed_kind(entry)
+            weight = self._entry_weight(entry)
+            if kind == "reward":
+                reward_samples.append(
+                    SubjectEventRewardSample(
+                        subject_text=entry.get("subject_text"),
+                        action_text=entry.get("action_text"),
+                        object_text=entry.get("object_text"),
+                        subject_instance_id=entry.get("subject_instance_id"),
+                        object_instance_id=entry.get("object_instance_id"),
+                        reward_value=float(entry.get("reward_value", 0.0)),
+                        weight=weight,
+                        source="confirmed_info_pair",
+                    )
+                )
+            elif kind == "surprise":
+                surprise_samples.append(
+                    SubjectEventSurpriseSample(
+                        subject_text=entry.get("subject_text"),
+                        action_text=entry.get("action_text"),
+                        object_text=entry.get("object_text"),
+                        subject_instance_id=entry.get("subject_instance_id"),
+                        object_instance_id=entry.get("object_instance_id"),
+                        surprise_value=float(entry.get("surprise_value", 0.0)),
+                        weight=weight,
+                        source="confirmed_info_pair",
+                    )
+                )
+            elif kind == "event":
+                sample = self._event_surprise_sample_from_entry(
+                    entry,
+                    surprise_value=float(event_surprise_target),
+                    weight=weight,
+                )
+                if sample is not None:
+                    surprise_samples.append(sample)
+        return reward_samples, surprise_samples
+
+    def _train_confirmed_value_models(
+        self,
+        entries,
+        *,
+        value_model_epochs: int = 1,
+        event_surprise_target: float = -50.0,
+    ):
+        reward_samples, surprise_samples = self._value_model_samples_from_confirmed_entries(
+            entries,
+            event_surprise_target=event_surprise_target,
+        )
+        reward_history = []
+        surprise_history = []
+        if reward_samples:
+            _, _, _, reward_trainer = self._emotion_reward_stack(role="subject")
+            reward_history = reward_trainer.train_epochs(reward_samples, epochs=int(value_model_epochs))
+        if surprise_samples:
+            _, _, _, surprise_trainer = self._surprise_stack()
+            surprise_history = surprise_trainer.train_epochs(surprise_samples, epochs=int(value_model_epochs))
+        return {
+            "enabled": True,
+            "epoch_count": int(value_model_epochs),
+            "reward": {
+                "sample_count": len(reward_samples),
+                "history": reward_history,
+                "last_result": None if not reward_history else reward_history[-1],
+            },
+            "surprise": {
+                "sample_count": len(surprise_samples),
+                "history": surprise_history,
+                "last_result": None if not surprise_history else surprise_history[-1],
+            },
+        }
+
+    def train_confirmed_info_pairs(
+        self,
+        confirmed_items,
+        *,
+        epochs: Optional[int] = None,
+        instance_epochs: Optional[int] = None,
+        value_model_epochs: int = 1,
+        step_scale: Optional[float] = None,
+        event_surprise_target: float = -50.0,
+        train_instance_embeddings: bool = True,
+        train_value_models: bool = True,
+    ):
+        """Train from confirmed yes info pairs as a second phase after question().
+
+        The update is split into two targets. Instance embeddings are grouped by
+        short-memory instance_id and updated with averaged gradients. Reward/surprise
+        model parameters are trained separately as batched value-model updates.
+        """
+        import torch
+
+        if instance_epochs is None:
+            instance_epochs = 5 if epochs is None else int(epochs)
+
+        entries = [self._confirmed_entry_from_item(item) for item in list(confirmed_items or [])]
+        for entry in entries:
+            entry["memory_kind"] = self._confirmed_kind(entry)
+
+        grouped = {}
+        for entry in entries:
+            for instance_id in self._confirmed_instance_ids(entry):
+                grouped.setdefault(instance_id, []).append(entry)
+
+        empty_result = {
+            "command": "train_confirmed_info_pairs",
+            "status": "empty",
+            "confirmed_pair_count": len(entries),
+            "instance_training": {
+                "enabled": bool(train_instance_embeddings),
+                "epoch_count": int(instance_epochs),
+                "instance_count": 0,
+                "updates": [],
+            },
+            "value_model_training": {
+                "enabled": bool(train_value_models),
+                "epoch_count": int(value_model_epochs),
+                "reward": {"sample_count": 0, "history": [], "last_result": None},
+                "surprise": {"sample_count": 0, "history": [], "last_result": None},
+            },
+        }
+        if not entries:
+            return empty_result
+
+        memory = self.consciousness.short_memory
+        reward_encoder, reward_model, _, _ = self._emotion_reward_stack(role="subject")
+        surprise_encoder, surprise_model, _, _ = self._surprise_stack()
+
+        instance_result = {
+            "enabled": bool(train_instance_embeddings),
+            "epoch_count": int(instance_epochs),
+            "instance_count": len(grouped),
+            "updates": [],
+        }
+
+        if train_instance_embeddings and grouped:
+            rm, arm, kt = memory._load_language_context()
+            frozen_params = list(reward_model.parameters()) + list(surprise_model.parameters())
+            previous_requires_grad = [param.requires_grad for param in frozen_params]
+            for param in frozen_params:
+                param.requires_grad_(False)
+
+            updates = {instance_id: {"instance_id": instance_id, "entry_count": len(items), "loss_history": []} for instance_id, items in grouped.items()}
+            scale = memory.relation_step_scale if step_scale is None else float(step_scale)
+
+            try:
+                for _ in range(int(instance_epochs)):
+                    for instance_id, instance_entries in grouped.items():
+                        metadata = memory.get_noun_instance_metadata(instance_id) or {}
+                        noun_text = metadata.get("noun_text")
+                        if noun_text is None:
+                            for entry in instance_entries:
+                                noun_text = entry.get("source_text") or entry.get("subject_text") or entry.get("noun_text")
+                                if noun_text:
+                                    break
+                        if noun_text is None:
+                            updates[instance_id].setdefault("skipped_reasons", []).append("missing_noun_text")
+                            continue
+
+                        noun_type, base_embedding, resolved_instance_id = memory.ensure_noun_instance(str(noun_text), instance_id)
+                        trainable_embedding = base_embedding.detach().clone().requires_grad_(True)
+                        losses = []
+                        weights = []
+
+                        for entry in instance_entries:
+                            kind = self._confirmed_kind(entry)
+                            loss = None
+                            if kind == "relation":
+                                loss = self._loss_for_confirmed_relation_entry(
+                                    entry,
+                                    instance_id,
+                                    trainable_embedding,
+                                    rm,
+                                    arm,
+                                    kt,
+                                )
+                            elif kind == "reward":
+                                loss = self._loss_for_confirmed_reward_entry(
+                                    entry,
+                                    instance_id,
+                                    trainable_embedding,
+                                    reward_model,
+                                    reward_encoder,
+                                )
+                            elif kind == "surprise":
+                                loss = self._loss_for_confirmed_surprise_entry(
+                                    entry,
+                                    instance_id,
+                                    trainable_embedding,
+                                    surprise_model,
+                                    surprise_encoder,
+                                )
+                            elif kind == "event":
+                                sample = self._event_surprise_sample_from_entry(
+                                    entry,
+                                    surprise_value=float(event_surprise_target),
+                                    weight=self._entry_weight(entry),
+                                )
+                                if sample is not None:
+                                    event_entry = {
+                                        "subject_text": sample.subject_text,
+                                        "subject_instance_id": sample.subject_instance_id,
+                                        "action_text": sample.action_text,
+                                        "object_text": sample.object_text,
+                                        "object_instance_id": sample.object_instance_id,
+                                        "surprise_value": sample.surprise_value,
+                                    }
+                                    loss = self._loss_for_confirmed_surprise_entry(
+                                        event_entry,
+                                        instance_id,
+                                        trainable_embedding,
+                                        surprise_model,
+                                        surprise_encoder,
+                                    )
+                            if loss is not None:
+                                losses.append(loss)
+                                weights.append(self._entry_weight(entry))
+
+                        if not losses:
+                            updates[instance_id].setdefault("skipped_reasons", []).append("no_losses")
+                            continue
+
+                        total_loss = self._weighted_mean_torch_losses(losses, weights)
+                        total_loss.backward()
+                        if trainable_embedding.grad is None:
+                            updates[instance_id].setdefault("skipped_reasons", []).append("no_gradient")
+                            continue
+
+                        noun_idx = noun_type if noun_type is not None else rm._ensure_noun(str(noun_text).lower())
+                        lr = float(rm.lr_per_embedding[int(noun_idx)]) * scale
+                        with torch.no_grad():
+                            updated_embedding = trainable_embedding - lr * trainable_embedding.grad
+                        trainable_embedding.grad.zero_()
+                        memory.store_noun_instance(resolved_instance_id, updated_embedding.detach(), noun_text=str(noun_text))
+                        updates[instance_id]["loss_history"].append(float(total_loss.item()))
+                        updates[instance_id]["final_embedding_norm"] = float(updated_embedding.norm().item())
+            finally:
+                for param, requires_grad in zip(frozen_params, previous_requires_grad):
+                    param.requires_grad_(requires_grad)
+
+            instance_result["updates"] = list(updates.values())
+        elif not train_instance_embeddings:
+            instance_result["updates"] = []
+
+        if train_value_models:
+            value_model_result = self._train_confirmed_value_models(
+                entries,
+                value_model_epochs=int(value_model_epochs),
+                event_surprise_target=float(event_surprise_target),
+            )
+        else:
+            value_model_result = {
+                "enabled": False,
+                "epoch_count": int(value_model_epochs),
+                "reward": {"sample_count": 0, "history": [], "last_result": None},
+                "surprise": {"sample_count": 0, "history": [], "last_result": None},
+            }
+
+        status = "trained" if (train_instance_embeddings or train_value_models) else "skipped"
+        return {
+            "command": "train_confirmed_info_pairs",
+            "status": status,
+            "confirmed_pair_count": len(entries),
+            "instance_training": instance_result,
+            "value_model_training": value_model_result,
+            # Backward-compatible summary fields.
+            "epoch_count": int(instance_epochs),
+            "instance_count": int(instance_result.get("instance_count", 0)),
+            "updates": list(instance_result.get("updates", [])),
+        }
+
+    def answer_inf_question(
+        self,
+        question: dict,
+        answer_text: str,
+        *,
+        save: bool = True,
+        event_surprise_target: float = -50.0,
+        step_scale: Optional[float] = None,
+    ):
+        """Apply a yes/no answer to one inf_question item returned by question().
+
+        no deletes the original short-memory info pair. yes only marks the pair as confirmed;
+        call train_confirmed_info_pairs() as the second phase to update instance embeddings.
+        """
+        normalized_answer = str(answer_text).strip().lower()
+        if normalized_answer not in {"y", "yes", "n", "no"}:
+            raise ValueError("answer_text must be one of: y, yes, n, no")
+
+        entry = dict(question.get("memory_entry", question))
+        kind = str(entry.get("memory_kind") or "")
+        if not kind:
+            pair_kind = str(entry.get("pair_kind") or question.get("kind") or "")
+            if pair_kind in {"noun_noun_relation", "adj_noun_relation"}:
+                kind = "relation"
+            elif pair_kind == "subject_event_reward":
+                kind = "reward"
+            elif pair_kind == "subject_event_surprise":
+                kind = "surprise"
+            else:
+                kind = "event"
+            entry["memory_kind"] = kind
+
+        if normalized_answer in {"n", "no"}:
+            return {
+                "command": "answer_inf_question",
+                "accepted": False,
+                "action": "delete_info_pair",
+                "kind": kind,
+                "question": question,
+                "result": self._remove_short_memory_entry(entry),
+            }
+
+        return {
+            "command": "answer_inf_question",
+            "accepted": True,
+            "action": "pending_yes_confirmation",
+            "kind": kind,
+            "question": question,
+            "confirmed_yes": [self.inf_question(entry, reason="user_confirmed_yes")],
+            "result": {
+                "status": "confirmed",
+                "training_required": True,
+            },
+        }
 
     def answer_memory_question(
         self,

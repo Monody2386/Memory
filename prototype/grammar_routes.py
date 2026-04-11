@@ -110,6 +110,24 @@ DEFAULT_EXTRACTOR_ROUTES = (
         match_mode="exact",
     ),
     ExtractorRoute(
+        pattern_name="negative_noun_can_action_object_surprise",
+        structure=("noun", "helper", "negative", "action", "noun"),
+        extractor_name="_extract_pattern_negative_modal_surprise_action_with_object",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
+        pattern_name="negative_noun_can_action_object_surprise",
+        structure=("noun", "negative", "helper", "action", "noun"),
+        extractor_name="_extract_pattern_negative_modal_surprise_action_with_object",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
+        pattern_name="noun_can_action_object_surprise",
+        structure=("noun", "helper", "action", "noun"),
+        extractor_name="_extract_pattern_modal_surprise_action_with_object",
+        match_mode="exact",
+    ),
+    ExtractorRoute(
         pattern_name="negative_noun_action_object_phrase",
         structure=("noun", "negative", "action", "noun"),
         extractor_name="_extract_pattern_negative_action_with_object",

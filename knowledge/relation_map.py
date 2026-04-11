@@ -44,6 +44,7 @@ DEFAULT_NOUNS = [
 DEFAULT_RELATIONS = [
     "include",
     "belong to",
+    "job_relation",
 ]
 
 relation_map = np.zeros((noun_number, noun_number), dtype=np.int64)
@@ -56,6 +57,16 @@ lr_per_embedding = np.ones(noun_number)
 def _ensure_lr_relation_capacity() -> None:
     global lr_relation
     lr_relation = ensure_vector_capacity(lr_relation, relation_num)
+
+
+def _ensure_default_relations() -> None:
+    for relation in DEFAULT_RELATIONS:
+        if relation not in relation_list:
+            if len(relation_list) >= relation_num:
+                raise ValueError(
+                    f"relation_list is full; cannot register default relation '{relation}'"
+                )
+            relation_list.append(relation)
 
 
 def _placeholder_name(index: int) -> str:
@@ -157,6 +168,7 @@ def load_relation_data(file_path="relation_data.npz"):
     relation_map = data["relation_map"].astype(np.int64, copy=False)
     noun_list = data["noun_list"].tolist()
     relation_list = data["relation_list"].tolist()
+    _ensure_default_relations()
     lr_per_embedding = data["lr_per_embedding"]
     lr_relation = ensure_vector_capacity(data["lr_relation"], relation_num)
 

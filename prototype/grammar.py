@@ -53,6 +53,8 @@ class ActionTuple:
     owner_role: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
     polarity: int = 1
+    accept_label: str = "none"
+    question_label: str = "none"
 
 
 @dataclass
@@ -67,6 +69,8 @@ class RelationTuple:
     owner_role: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
     polarity: int = 1
+    accept_label: str = "none"
+    question_label: str = "none"
 
 
 @dataclass
@@ -80,6 +84,23 @@ class RewardTuple:
     object_instance_id: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
     polarity: int = 1
+    accept_label: str = "none"
+    question_label: str = "none"
+
+
+@dataclass
+class SurpriseTuple:
+    subject: str
+    surprise_word: str
+    surprise_value: float
+    action: Optional[str] = None
+    object: Optional[str] = None
+    subject_instance_id: Optional[str] = None
+    object_instance_id: Optional[str] = None
+    source_tokens: List[str] = field(default_factory=list)
+    polarity: int = 1
+    accept_label: str = "none"
+    question_label: str = "none"
 
 
 @dataclass
@@ -90,6 +111,15 @@ class InstanceAttributeUpdate:
     noun_text: Optional[str] = None
     source_tokens: List[str] = field(default_factory=list)
     polarity: int = 1
+    question_label: str = "none"
+
+
+@dataclass
+class QuestionInfo:
+    is_question: bool = False
+    marker: Optional[str] = None
+    question_type: Optional[str] = None
+    original_structure: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -103,7 +133,9 @@ class ParsedSentence:
     action_tuples: List[ActionTuple] = field(default_factory=list)
     relation_tuples: List[RelationTuple] = field(default_factory=list)
     reward_tuples: List[RewardTuple] = field(default_factory=list)
+    surprise_tuples: List[SurpriseTuple] = field(default_factory=list)
     instance_updates: List[InstanceAttributeUpdate] = field(default_factory=list)
+    question_info: QuestionInfo = field(default_factory=QuestionInfo)
 
 
 @dataclass
@@ -150,6 +182,8 @@ class ShortMemoryRelationState:
     time_position: int
     pair_index: int
     polarity: int = 1
+    accept_label: str = "none"
+    question_label: str = "none"
 
 
 @dataclass
@@ -214,19 +248,31 @@ STANDALONE_POSSESSIVE_EXPANSIONS = {
     "theirs": "their",
 }
 BE_VERB_SET = {"am", "is", "are", "was", "were", "be", "been", "being"}
-HELPER_WORD_SET = {"by", "do", "does", "did"}
+HELPER_WORD_SET = {"by", "do", "does", "did", "can", "could"}
+QUESTION_HELPER_WORD_SET = {"do", "does", "did", "can", "could"}
+DO_QUESTION_HELPER_WORD_SET = {"do", "does", "did"}
+ABILITY_HELPER_WORD_SET = {"can", "could"}
 NEGATIVE_WORD_SET = {"not", "no", "never", "n't"}
 REWARD_WORD_VALUE_MAP = {
-    "hate": -100.0,
-    "dislike": -60.0,
-    "like": 60.0,
-    "love": 100.0,
+    "hate": -50.0,
+    "dislike": -30.0,
+    "like": 30.0,
+    "love": 50.0,
 }
-NEGATED_REWARD_SCALE = -0.5
+SURPRISE_WORD_VALUE_MAP = {
+    "can": -50.0,
+    "could": -50.0,
+}
+NEGATED_REWARD_SCALE = 0.5
+NEGATED_SURPRISE_SCALE = 0.5
 
 
 def negate_reward_value(value: float) -> float:
-    return float(value) * NEGATED_REWARD_SCALE
+    return -float(value) * NEGATED_REWARD_SCALE
+
+
+def negate_surprise_value(value: float) -> float:
+    return -float(value) * NEGATED_SURPRISE_SCALE
 
 
 # ===========================================================================
@@ -461,6 +507,9 @@ def tag_tokens(
         if token in lexicons["actions"]:
             tagged_tokens.append(TaggedToken(text=token, pos="action", index=index, source="action_list", entity_text=token))
             continue
+        if is_named_person_noun(token):
+            tagged_tokens.append(TaggedToken(text=token, pos="noun", index=index, source="named_person_list", entity_text=token))
+            continue
 
         token_info = question_engine.what_is_token(token, position=index, tokens=tokens)
         pos = token_info.predicted_pos if token_info.predicted_pos != "unknown" else "noun"
@@ -658,6 +707,9 @@ def _resolve_existing_possessive_instance_id(
 
 
 def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
+    if getattr(parsed.question_info, "is_question", False):
+        return "question_sentence"
+
     has_action = bool(parsed.action_tuples)
     has_noun_relation = any(
         relation_tuple.kind == "noun_noun_relation" for relation_tuple in parsed.relation_tuples
@@ -679,6 +731,8 @@ def classify_sentence_type_from_parsed(parsed: ParsedSentence) -> str:
         return "instance_update_sentence"
     if parsed.reward_tuples:
         return "reward_sentence"
+    if parsed.surprise_tuples:
+        return "surprise_sentence"
     return "unknown_sentence"
 
 
@@ -1102,6 +1156,60 @@ def _reduce_article_noun_phrases(
     return reduced_tokens, reduced_tags
 
 
+def _detect_and_reorder_question_helper(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+) -> Tuple[List[str], List[TaggedToken], QuestionInfo]:
+    """Move leading question markers behind the following noun before helper deletion."""
+    if not tokens or not tagged_tokens:
+        return list(tokens), list(tagged_tokens), QuestionInfo()
+
+    first_tag = tagged_tokens[0]
+    first_token = tokens[0]
+    first_token_key = first_token.lower()
+    is_helper_question = first_tag.pos == "helper" and first_token_key in QUESTION_HELPER_WORD_SET
+    is_be_question = first_tag.pos == "be"
+    if not (is_helper_question or is_be_question):
+        return list(tokens), list(tagged_tokens), QuestionInfo()
+
+    noun_index: Optional[int] = None
+    if is_be_question and len(tagged_tokens) > 1:
+        noun_index = 1
+    else:
+        for index in range(1, len(tagged_tokens)):
+            if tagged_tokens[index].pos == "noun":
+                noun_index = index
+                break
+
+    question_info = QuestionInfo(
+        is_question=True,
+        marker=first_token_key,
+        question_type="yes_no",
+        original_structure=tuple(tag.pos for tag in tagged_tokens),
+    )
+    if noun_index is None:
+        return list(tokens), list(tagged_tokens), question_info
+
+    reordered_tokens = list(tokens)
+    reordered_tags = list(tagged_tokens)
+    if is_be_question and reordered_tags[noun_index].pos not in {"noun", "pronoun"}:
+        subject_tag = reordered_tags[noun_index]
+        reordered_tags[noun_index] = TaggedToken(
+            text=subject_tag.text,
+            pos="noun",
+            index=subject_tag.index,
+            source="be_question_subject",
+            question_prompt=subject_tag.question_prompt,
+            instance_id=subject_tag.instance_id,
+            entity_text=subject_tag.entity_text or subject_tag.text,
+            owner_instance_id=subject_tag.owner_instance_id,
+            owner_role=subject_tag.owner_role,
+        )
+    reordered_tokens[0], reordered_tokens[noun_index] = reordered_tokens[noun_index], reordered_tokens[0]
+    reordered_tags[0], reordered_tags[noun_index] = reordered_tags[noun_index], reordered_tags[0]
+    return reordered_tokens, reordered_tags, question_info
+
+
 def _reduce_helper_tokens(
     tokens: Sequence[str],
     tagged_tokens: Sequence[TaggedToken],
@@ -1110,7 +1218,7 @@ def _reduce_helper_tokens(
     reduced_tokens: List[str] = []
     reduced_tags: List[TaggedToken] = []
     for token, tag in zip(tokens, tagged_tokens):
-        if tag.pos == "helper":
+        if tag.pos == "helper" and token.lower() not in ABILITY_HELPER_WORD_SET:
             continue
         reduced_tokens.append(token)
         reduced_tags.append(tag)
@@ -1265,7 +1373,21 @@ def _extract_pattern_be_noun_core(
                     polarity=int(polarity),
                 )
             )
-            parsed.sentence_type = "instance_update_sentence"
+            parsed.relation_tuples.append(
+                RelationTuple(
+                    source=left_noun,
+                    relation=f"{slot_name}_relation",
+                    target=right_noun,
+                    kind="noun_noun_relation",
+                    source_instance_id=left_instance_id,
+                    target_instance_id=right_instance_id,
+                    owner_instance_id=left_owner_instance_id,
+                    owner_role=left_owner_role,
+                    source_tokens=list(tokens),
+                    polarity=int(polarity),
+                )
+            )
+            parsed.sentence_type = "mixed_sentence"
             return parsed
 
     if left_instance_id is None:
@@ -1386,9 +1508,55 @@ def _extract_pattern_reward_sentence(
                 subject_instance_id=subject_instance_id,
                 object_instance_id=object_instance_id,
                 source_tokens=list(tokens),
-                polarity=int(polarity),
+                polarity=1,
             )
         ],
+    )
+
+
+def _extract_pattern_do_question_action_reward(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    question_info: QuestionInfo,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 3:
+        raise ValueError("do-question action reward requires noun + action + noun")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    subject_instance_id = tagged_tokens[0].instance_id
+    verb = tokens[1].lower()
+    object_noun, _, object_instance_id, _, _ = _parse_noun_phrase([tokens[2]], [tagged_tokens[2]])
+    question_word = "question"
+
+    return ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="do_question_noun_action_object_reward",
+        sentence_type="question_sentence",
+        reward_tuples=[
+            RewardTuple(
+                subject=subject,
+                reward_word=question_word,
+                reward_value=0.0,
+                action=verb,
+                object=object_noun,
+                subject_instance_id=subject_instance_id,
+                object_instance_id=object_instance_id,
+                source_tokens=list(tokens),
+                polarity=1,
+                accept_label="none",
+                question_label="question",
+            )
+        ],
+        question_info=question_info,
     )
 
 
@@ -1419,7 +1587,121 @@ def _extract_pattern_negative_reward_sentence(
     parsed.structure = tuple(tag.pos for tag in tagged_tokens)
     for reward_tuple in parsed.reward_tuples:
         reward_tuple.source_tokens = list(tokens)
-        reward_tuple.polarity = -1
+        reward_tuple.polarity = 1
+    return parsed
+
+
+def _extract_pattern_modal_surprise_action_with_object(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+    polarity: int = 1,
+) -> ParsedSentence:
+    del adjective_relation_types, infer_missing, instance_context, short_memory
+    if len(tokens) != 4:
+        raise ValueError("modal surprise sentence requires noun + can/could + action + noun")
+    modal = tokens[1].lower()
+    if modal not in ABILITY_HELPER_WORD_SET:
+        raise ValueError(f"Unsupported surprise modal: {modal}")
+
+    subject = _token_entity_text(tokens[0], tagged_tokens[0])
+    subject_instance_id = tagged_tokens[0].instance_id
+    action_text = tokens[2].lower()
+    object_noun, _, object_instance_id, _, _ = _parse_noun_phrase([tokens[3]], [tagged_tokens[3]])
+    surprise_value = SURPRISE_WORD_VALUE_MAP.get(modal)
+    if surprise_value is None:
+        raise ValueError(f"Unknown surprise word: {modal}")
+    if int(polarity) == -1:
+        surprise_value = negate_surprise_value(surprise_value)
+
+    return ParsedSentence(
+        sentence=" ".join(tokens),
+        tokens=list(tokens),
+        tagged_tokens=list(tagged_tokens),
+        structure=tuple(tag.pos for tag in tagged_tokens),
+        pattern_name="noun_can_action_object_surprise",
+        sentence_type="surprise_sentence",
+        surprise_tuples=[
+            SurpriseTuple(
+                subject=subject,
+                surprise_word=modal,
+                surprise_value=float(surprise_value),
+                action=action_text,
+                object=object_noun,
+                subject_instance_id=subject_instance_id,
+                object_instance_id=object_instance_id,
+                source_tokens=list(tokens),
+                polarity=1,
+            )
+        ],
+    )
+
+
+def _extract_pattern_can_question_action_surprise(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    question_info: QuestionInfo,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    parsed = _extract_pattern_modal_surprise_action_with_object(
+        tokens,
+        tagged_tokens,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.pattern_name = "can_question_noun_action_object_surprise"
+    parsed.sentence_type = "question_sentence"
+    parsed.question_info = question_info
+    return parsed
+
+
+def _extract_pattern_negative_modal_surprise_action_with_object(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    adjective_relation_types=None,
+    infer_missing: bool = True,
+    instance_context=None,
+    short_memory=None,
+) -> ParsedSentence:
+    if len(tokens) != 5:
+        raise ValueError("negative modal surprise sentence requires noun + can/could + negative + action + noun")
+
+    if tagged_tokens[1].pos == "helper" and tagged_tokens[2].pos == "negative":
+        reduced_tokens = [tokens[0], tokens[1], tokens[3], tokens[4]]
+        reduced_tags = [tagged_tokens[0], tagged_tokens[1], tagged_tokens[3], tagged_tokens[4]]
+    elif tagged_tokens[1].pos == "negative" and tagged_tokens[2].pos == "helper":
+        reduced_tokens = [tokens[0], tokens[2], tokens[3], tokens[4]]
+        reduced_tags = [tagged_tokens[0], tagged_tokens[2], tagged_tokens[3], tagged_tokens[4]]
+    else:
+        raise ValueError(f"Unsupported negative modal surprise structure: {tuple(tag.pos for tag in tagged_tokens)}")
+
+    parsed = _extract_pattern_modal_surprise_action_with_object(
+        reduced_tokens,
+        reduced_tags,
+        polarity=-1,
+        adjective_relation_types=adjective_relation_types,
+        infer_missing=infer_missing,
+        instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    parsed.tokens = list(tokens)
+    parsed.tagged_tokens = list(tagged_tokens)
+    parsed.structure = tuple(tag.pos for tag in tagged_tokens)
+    parsed.pattern_name = "negative_noun_can_action_object_surprise"
+    for surprise_tuple in parsed.surprise_tuples:
+        surprise_tuple.source_tokens = list(tokens)
+        surprise_tuple.polarity = 1
     return parsed
 
 
@@ -1957,6 +2239,19 @@ def _extract_pattern_negative_relation_between_noun_phrases(
     return parsed
 
 
+def _mark_parsed_question_label(parsed: ParsedSentence, label: str = "question") -> None:
+    for action_tuple in parsed.action_tuples:
+        action_tuple.question_label = label
+    for relation_tuple in parsed.relation_tuples:
+        relation_tuple.question_label = label
+    for reward_tuple in parsed.reward_tuples:
+        reward_tuple.question_label = label
+    for surprise_tuple in parsed.surprise_tuples:
+        surprise_tuple.question_label = label
+    for instance_update in parsed.instance_updates:
+        instance_update.question_label = label
+
+
 def _build_reduction_only_parse(
     sentence: str,
     reduced_tokens: Sequence[str],
@@ -2000,9 +2295,31 @@ def _match_extractor_route(structure: Tuple[str, ...], route) -> bool:
     raise ValueError(f"Unsupported extractor route match_mode: {route.match_mode}")
 
 
-def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken]):
-    del tokens
+def _select_extractor(
+    tokens: Sequence[str],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    question_info: Optional[QuestionInfo] = None,
+):
     structure = _structure_for_extractor_routing(tagged_tokens)
+    if question_info is not None and question_info.is_question:
+        if question_info.marker in DO_QUESTION_HELPER_WORD_SET and structure == ("noun", "action", "noun"):
+            def _do_question_extractor(*args, **kwargs):
+                return _extract_pattern_do_question_action_reward(
+                    *args,
+                    question_info=question_info,
+                    **kwargs,
+                )
+            return _do_question_extractor
+        if question_info.marker in ABILITY_HELPER_WORD_SET and structure == ("noun", "helper", "action", "noun"):
+            def _can_question_extractor(*args, **kwargs):
+                return _extract_pattern_can_question_action_surprise(
+                    *args,
+                    question_info=question_info,
+                    **kwargs,
+                )
+            return _can_question_extractor
+
     extractor_map = {
         "_extract_pattern_be_attribute": _extract_pattern_be_attribute,
         "_extract_pattern_negative_be_attribute": _extract_pattern_negative_be_attribute,
@@ -2010,6 +2327,8 @@ def _select_extractor(tokens: Sequence[str], tagged_tokens: Sequence[TaggedToken
         "_extract_pattern_negative_be_noun": _extract_pattern_negative_be_noun,
         "_extract_pattern_reward_sentence": _extract_pattern_reward_sentence,
         "_extract_pattern_negative_reward_sentence": _extract_pattern_negative_reward_sentence,
+        "_extract_pattern_modal_surprise_action_with_object": _extract_pattern_modal_surprise_action_with_object,
+        "_extract_pattern_negative_modal_surprise_action_with_object": _extract_pattern_negative_modal_surprise_action_with_object,
         "_extract_pattern_intransitive_action": _extract_pattern_intransitive_action,
         "_extract_pattern_action_with_object": _extract_pattern_action_with_object,
         "_extract_pattern_negative_intransitive_action": _extract_pattern_negative_intransitive_action,
@@ -2085,7 +2404,7 @@ def parse_sentence(
         instance_context=instance_context,
         short_memory=short_memory,
     )
-    reduced_tokens, reduced_tags = _reduce_helper_tokens(
+    reduced_tokens, reduced_tags, question_info = _detect_and_reorder_question_helper(
         reduced_tokens,
         reduced_tags,
     )
@@ -2095,9 +2414,17 @@ def parse_sentence(
         instance_context=instance_context,
         short_memory=short_memory,
     )
+    reduced_tokens, reduced_tags = _reduce_helper_tokens(
+        reduced_tokens,
+        reduced_tags,
+    )
 
     try:
-        extractor = _select_extractor(reduced_tokens, reduced_tags)
+        extractor = _select_extractor(
+            reduced_tokens,
+            reduced_tags,
+            question_info=question_info,
+        )
     except ValueError:
         if reduced_relations or reduced_tokens != tokens or tuple(tag.pos for tag in reduced_tags) != tuple(tag.pos for tag in tagged_tokens):
             parsed = _build_reduction_only_parse(sentence, reduced_tokens, reduced_tags, reduced_relations)
@@ -2114,6 +2441,9 @@ def parse_sentence(
         )
         parsed.relation_tuples = list(reduced_relations) + list(parsed.relation_tuples)
 
+    parsed.question_info = question_info
+    if question_info.is_question:
+        _mark_parsed_question_label(parsed)
     parsed = resolve_instances_for_parsed_sentence(
         parsed,
         instance_context=instance_context,
@@ -2262,6 +2592,8 @@ def resolve_instances_for_parsed_sentence(
                 owner_role=action_tuple.owner_role,
                 source_tokens=list(action_tuple.source_tokens),
                 polarity=action_tuple.polarity,
+                accept_label=action_tuple.accept_label,
+                question_label=action_tuple.question_label,
             )
         )
 
@@ -2290,6 +2622,8 @@ def resolve_instances_for_parsed_sentence(
                 owner_role=relation_tuple.owner_role,
                 source_tokens=list(relation_tuple.source_tokens),
                 polarity=relation_tuple.polarity,
+                accept_label=relation_tuple.accept_label,
+                question_label=relation_tuple.question_label,
             )
         )
 
@@ -2324,6 +2658,44 @@ def resolve_instances_for_parsed_sentence(
                 object_instance_id=object_instance_id,
                 source_tokens=list(reward_tuple.source_tokens),
                 polarity=reward_tuple.polarity,
+                accept_label=reward_tuple.accept_label,
+                question_label=reward_tuple.question_label,
+            )
+        )
+
+    resolved_surprises: List[SurpriseTuple] = []
+    for surprise_tuple in parsed.surprise_tuples:
+        subject_instance_id = surprise_tuple.subject_instance_id
+        if subject_instance_id is None:
+            subject_instance_id = sentence_assignments.get(surprise_tuple.subject)
+        if subject_instance_id is None:
+            subject_instance_id = _resolve_existing_instance_id(surprise_tuple.subject, resolved_context, sentence_assignments)
+        if subject_instance_id is None:
+            subject_instance_id = _build_instance_id(surprise_tuple.subject, create_counters, instance_context=resolved_context)
+        sentence_assignments[surprise_tuple.subject] = subject_instance_id
+
+        object_instance_id = surprise_tuple.object_instance_id
+        if surprise_tuple.object is not None and object_instance_id is None:
+            object_instance_id = sentence_assignments.get(surprise_tuple.object)
+            if object_instance_id is None:
+                object_instance_id = _resolve_existing_instance_id(surprise_tuple.object, resolved_context, sentence_assignments)
+            if object_instance_id is None:
+                object_instance_id = _build_instance_id(surprise_tuple.object, create_counters, instance_context=resolved_context)
+            sentence_assignments[surprise_tuple.object] = object_instance_id
+
+        resolved_surprises.append(
+            SurpriseTuple(
+                subject=surprise_tuple.subject,
+                surprise_word=surprise_tuple.surprise_word,
+                surprise_value=surprise_tuple.surprise_value,
+                action=surprise_tuple.action,
+                object=surprise_tuple.object,
+                subject_instance_id=subject_instance_id,
+                object_instance_id=object_instance_id,
+                source_tokens=list(surprise_tuple.source_tokens),
+                polarity=surprise_tuple.polarity,
+                accept_label=surprise_tuple.accept_label,
+                question_label=surprise_tuple.question_label,
             )
         )
 
@@ -2337,7 +2709,9 @@ def resolve_instances_for_parsed_sentence(
         action_tuples=resolved_actions,
         relation_tuples=resolved_relations,
         reward_tuples=resolved_rewards,
+        surprise_tuples=resolved_surprises,
         instance_updates=list(parsed.instance_updates),
+        question_info=parsed.question_info,
     )
 
 
@@ -2643,6 +3017,8 @@ def parsed_sentence_to_relation_memory_states(
                 time_position=int(time_position),
                 pair_index=pair_index,
                 polarity=relation_tuple.polarity,
+                accept_label=relation_tuple.accept_label,
+                question_label=relation_tuple.question_label,
             )
         )
 
@@ -2723,6 +3099,7 @@ def append_sentence_to_short_memory(
     adjective_relation_types: Optional[
         Union[Sequence[RelationOverride], Mapping[str, RelationOverride]]
     ] = None,
+    sentence_label: Optional[str] = None,
 ):
     parsed = parse_sentence(
         sentence,
@@ -2735,6 +3112,12 @@ def append_sentence_to_short_memory(
         explicit_time_position=time_position,
     )
     action_type_map = action_type_map or build_action_type_map(world_model)
+    if sentence_label is None:
+        if hasattr(short_memory, "next_sentence_label"):
+            sentence_label = short_memory.next_sentence_label()
+        else:
+            sentence_label = f"sentence:{int(resolved_time_position)}"
+    sentence_label = str(sentence_label)
     sentence_event_index = short_memory.next_event_index() if parsed.action_tuples else None
 
     relation_states = parsed_sentence_to_relation_memory_states(
@@ -2743,6 +3126,8 @@ def append_sentence_to_short_memory(
     )
 
     for instance_update in parsed.instance_updates:
+        if instance_update.question_label == "question":
+            continue
         update_kwargs = {
             "extra_attributes": {instance_update.attribute_name: instance_update.attribute_value},
             "attribute_polarities": {instance_update.attribute_name: instance_update.polarity},
@@ -2793,6 +3178,9 @@ def append_sentence_to_short_memory(
             object_text=reward_tuple.object,
             object_instance_id=object_instance_id,
             polarity=reward_tuple.polarity,
+            accept_label=reward_tuple.accept_label,
+            question_label=reward_tuple.question_label,
+            sentence_label=sentence_label,
             score=base_score,
             time_position=int(resolved_time_position),
             pair_index=pair_index,
@@ -2808,6 +3196,53 @@ def append_sentence_to_short_memory(
                 "object_instance_id": object_instance_id,
                 "time_position": int(resolved_time_position),
                 "pair_index": pair_index,
+                "accept_label": reward_tuple.accept_label,
+                "question_label": reward_tuple.question_label,
+                "sentence_label": sentence_label,
+            },
+        )
+
+    for pair_index, surprise_tuple in enumerate(parsed.surprise_tuples):
+        _, _, subject_instance_id = short_memory.ensure_noun_instance(
+            surprise_tuple.subject,
+            surprise_tuple.subject_instance_id,
+        )
+        object_instance_id = None
+        if surprise_tuple.object is not None:
+            _, _, object_instance_id = short_memory.ensure_noun_instance(
+                surprise_tuple.object,
+                surprise_tuple.object_instance_id,
+            )
+        short_memory.append_surprise(
+            subject_text=surprise_tuple.subject,
+            subject_instance_id=subject_instance_id,
+            surprise_word=surprise_tuple.surprise_word,
+            surprise_value=surprise_tuple.surprise_value,
+            action_text=surprise_tuple.action,
+            object_text=surprise_tuple.object,
+            object_instance_id=object_instance_id,
+            polarity=surprise_tuple.polarity,
+            accept_label=surprise_tuple.accept_label,
+            question_label=surprise_tuple.question_label,
+            sentence_label=sentence_label,
+            score=base_score,
+            time_position=int(resolved_time_position),
+            pair_index=pair_index,
+            info_pair={
+                "pair_kind": "subject_event_surprise",
+                "subject": surprise_tuple.subject,
+                "subject_instance_id": subject_instance_id,
+                "surprise_word": surprise_tuple.surprise_word,
+                "surprise_value": surprise_tuple.surprise_value,
+                "polarity": surprise_tuple.polarity,
+                "action": surprise_tuple.action,
+                "object": surprise_tuple.object,
+                "object_instance_id": object_instance_id,
+                "time_position": int(resolved_time_position),
+                "pair_index": pair_index,
+                "accept_label": surprise_tuple.accept_label,
+                "question_label": surprise_tuple.question_label,
+                "sentence_label": sentence_label,
             },
         )
 
@@ -2825,6 +3260,9 @@ def append_sentence_to_short_memory(
             source_type=relation_state.source_index,
             target_type=relation_state.target_index,
             polarity=relation_state.polarity,
+            accept_label=relation_state.accept_label,
+            question_label=relation_state.question_label,
+            sentence_label=sentence_label,
             source_embedding=None,
             target_embedding=None,
             info_pair={
@@ -2837,6 +3275,9 @@ def append_sentence_to_short_memory(
                 "time_position": relation_state.time_position,
                 "pair_index": relation_state.pair_index,
                 "polarity": relation_state.polarity,
+                "accept_label": relation_state.accept_label,
+                "question_label": relation_state.question_label,
+                "sentence_label": sentence_label,
             },
         )
 
@@ -2898,6 +3339,9 @@ def append_sentence_to_short_memory(
             adjectives=list(state.adjectives),
             pair_kind=state.pair_kind,
             polarity=state.polarity,
+            accept_label=action_tuple.accept_label,
+            question_label=action_tuple.question_label,
+            sentence_label=sentence_label,
             info_pair={
                 "pair_kind": state.pair_kind,
                 "noun": state.noun,
@@ -2909,6 +3353,9 @@ def append_sentence_to_short_memory(
                 "time_position": state.time_position,
                 "pair_index": state.pair_index,
                 "event_index": sentence_event_index,
+                "accept_label": action_tuple.accept_label,
+                "question_label": action_tuple.question_label,
+                "sentence_label": sentence_label,
             },
         )
 
