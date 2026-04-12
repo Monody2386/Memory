@@ -471,6 +471,108 @@ class HighLevelCommands:
             "focus": focus,
         }
 
+    def encode(
+        self,
+        sentence: str,
+        *,
+        time_position: Optional[int] = None,
+        base_score: float = 1.0,
+        adjective_relation_types: Optional[Any] = None,
+        auto_accept: bool = True,
+        interact: bool = True,
+        auto_inf_answer: Optional[str] = "yes",
+        confirm_threshold: float = 50.0,
+        yes_threshold: float = 30.0,
+        no_threshold: float = 70.0,
+        instance_epochs: int = 5,
+        value_model_epochs: int = 1,
+        step_scale: Optional[float] = None,
+        event_surprise_target: float = -50.0,
+        train_instance_embeddings: bool = True,
+        train_value_models: bool = True,
+    ):
+        """Encode one sentence end-to-end until confirmed info updates embeddings."""
+        what_result = self.question_what(
+            sentence,
+            time_position=time_position,
+            base_score=base_score,
+            adjective_relation_types=adjective_relation_types,
+        )
+        if what_result.get("status") == "question":
+            return {
+                "command": "encode",
+                "status": "question_what",
+                "sentence": sentence,
+                "question_what_result": what_result,
+                "understand_result": None,
+                "accept_result": None,
+                "question_result": None,
+                "inf_answer_count": 0,
+                "inf_answers": [],
+                "confirmed_yes_count": 0,
+                "confirmed_yes": [],
+                "training_result": None,
+            }
+
+        understand_result = what_result.get("understand_result")
+        sentence_label = None if understand_result is None else understand_result.get("sentence_label")
+
+        accept_result = self.accept(sentence_label=sentence_label)
+        question_result = self.question(
+            sentence_label=sentence_label,
+            confirm_threshold=confirm_threshold,
+            yes_threshold=yes_threshold,
+            no_threshold=no_threshold,
+            auto_accept=auto_accept,
+            interact=interact,
+        )
+
+        confirmed_yes = list(question_result.get("confirmed_yes", []))
+        inf_answers = []
+        normalized_inf_answer = None if auto_inf_answer is None else str(auto_inf_answer).strip().lower()
+        if normalized_inf_answer not in {None, "yes", "y", "no", "n"}:
+            raise ValueError("auto_inf_answer must be one of: yes, y, no, n, or None")
+
+        if normalized_inf_answer in {"yes", "y", "no", "n"}:
+            for item in list(question_result.get("questions", [])):
+                if str(item.get("type")) != "inf_question":
+                    continue
+                answer_result = self.answer_inf_question(
+                    item,
+                    normalized_inf_answer,
+                    event_surprise_target=event_surprise_target,
+                    step_scale=step_scale,
+                )
+                inf_answers.append(answer_result)
+                if bool(answer_result.get("accepted")):
+                    confirmed_yes.extend(list(answer_result.get("confirmed_yes", [])))
+
+        training_result = self.train_confirmed_info_pairs(
+            confirmed_yes,
+            instance_epochs=instance_epochs,
+            value_model_epochs=value_model_epochs,
+            step_scale=step_scale,
+            event_surprise_target=event_surprise_target,
+            train_instance_embeddings=train_instance_embeddings,
+            train_value_models=train_value_models,
+        )
+
+        return {
+            "command": "encode",
+            "status": "encoded",
+            "sentence": sentence,
+            "sentence_label": sentence_label,
+            "question_what_result": what_result,
+            "understand_result": understand_result,
+            "accept_result": accept_result,
+            "question_result": question_result,
+            "inf_answer_count": len(inf_answers),
+            "inf_answers": inf_answers,
+            "confirmed_yes_count": len(confirmed_yes),
+            "confirmed_yes": confirmed_yes,
+            "training_result": training_result,
+        }
+
     def learn_relation(
         self,
         relation_kind: str,
@@ -1758,24 +1860,31 @@ class HighLevelCommands:
             }
 
         kind = question.get("kind")
+        entry = question.get("memory_entry", {})
+        source_noun = question.get("source_noun") or entry.get("source_text") or entry.get("subject_text") or entry.get("noun_text")
+        target = question.get("target") or entry.get("target_text") or entry.get("object_text") or entry.get("action_text")
+        relation_type = question.get("relation_type") or entry.get("relation_type")
+        relation_name = question.get("relation_name") or entry.get("relation_name")
+        if relation_type is None and kind in {"noun_noun_relation", "adj_noun_relation"} and relation_name is not None:
+            relation_type = self.consciousness.resolve_relation_type(kind, relation_name)
         if kind == "noun_noun_relation":
             result = self.consciousness.remember_noun_relation(
-                question["source_noun"],
-                question["target"],
-                int(question["relation_type"]),
+                source_noun,
+                target,
+                int(relation_type),
                 save=save,
             )
         elif kind == "adj_noun_relation":
             result = self.consciousness.remember_adj_relation(
-                question["source_noun"],
-                question["target"],
-                int(question["relation_type"]),
+                source_noun,
+                target,
+                int(relation_type),
                 save=save,
             )
         elif kind == "noun_action_relation":
             result = self.consciousness.remember_noun_action(
-                question["source_noun"],
-                question["target"],
+                source_noun,
+                target,
                 save=save,
             )
         elif kind == "subject_event_reward":

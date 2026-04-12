@@ -587,11 +587,16 @@ class Consciousness:
         training = importlib.import_module("knowledge.training")
         training._load_training_state()
         relation_map, _, _, lr_per_embedding, lr_relation = training.rm.load_relation_data()
-        adj_relation_map, _, _, lr_per_adjective, lr_adj_relation = training.arm.load_adj_relation_data()
-        if adj_relation_map is False:
-            raise FileNotFoundError(
-                "adj_relation_data.npz not found. Generate adjective relation data before joint training."
-            )
+        adj_loaded = training.arm.load_adj_relation_data()
+        if adj_loaded is False:
+            return {
+                "trained": False,
+                "saved": False,
+                "reason": "adj_relation_data_missing",
+                "knowledge_embedding_norm": float(training.knowledge_map_one.embedding.weight.norm().item()),
+                "adj_embedding_norm": float(training.adj_map_one.adjective_embedding.weight.norm().item()),
+            }
+        adj_relation_map, _, _, lr_per_adjective, lr_adj_relation = adj_loaded
 
         training.train_joint_average(
             knowledge_map_one=training.knowledge_map_one,

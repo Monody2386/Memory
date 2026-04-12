@@ -62,11 +62,15 @@ def answer_unknown_words(commands: HighLevelCommands, result: dict):
 def answer_memory_questions(commands: HighLevelCommands, memory_result: dict, planned_answers: dict):
     answers = []
     for question in memory_result["questions"]:
+        entry = question.get("memory_entry", {})
+        source_noun = question.get("source_noun") or entry.get("source_text") or entry.get("subject_text") or entry.get("noun_text")
+        target = question.get("target") or entry.get("target_text") or entry.get("object_text") or entry.get("action_text")
+        relation_name = question.get("relation_name") or entry.get("relation_name") or entry.get("reward_word") or entry.get("surprise_word")
         key = (
             question["kind"],
-            question["source_noun"],
-            question["target"],
-            question["relation_name"],
+            source_noun,
+            target,
+            relation_name,
         )
         answer_text = planned_answers.get(key)
         if answer_text is None:
@@ -79,6 +83,18 @@ def answer_memory_questions(commands: HighLevelCommands, memory_result: dict, pl
             )
         )
     return answers
+
+
+def describe_memory_question(question: dict) -> str:
+    prompt = question.get("prompt")
+    if prompt:
+        return str(prompt)
+    entry = question.get("memory_entry", {})
+    source = entry.get("source_text") or entry.get("subject_text") or entry.get("noun_text") or question.get("source_noun")
+    relation = entry.get("relation_name") or entry.get("reward_word") or entry.get("surprise_word") or question.get("relation_name")
+    target = entry.get("target_text") or entry.get("object_text") or entry.get("action_text") or question.get("target")
+    reason = question.get("reason") or "review"
+    return f"{question.get('kind')} | {source} -> {relation} -> {target} | reason={reason}"
 
 
 def run_demo(event_epochs: int = 10):
@@ -140,7 +156,7 @@ def run_demo(event_epochs: int = 10):
                 for item in memory_questions["questions"]:
                     print({
                         "kind": item["kind"],
-                        "prompt": item["prompt"],
+                        "prompt": describe_memory_question(item),
                     })
                 applied = answer_memory_questions(commands, memory_questions, planned_answers)
                 if applied:
