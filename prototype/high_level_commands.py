@@ -479,8 +479,6 @@ class HighLevelCommands:
         base_score: float = 1.0,
         adjective_relation_types: Optional[Any] = None,
         auto_accept: bool = True,
-        interact: bool = True,
-        auto_inf_answer: Optional[str] = "yes",
         confirm_threshold: float = 50.0,
         yes_threshold: float = 30.0,
         no_threshold: float = 70.0,
@@ -491,7 +489,12 @@ class HighLevelCommands:
         train_instance_embeddings: bool = True,
         train_value_models: bool = True,
     ):
-        """Encode one sentence end-to-end until confirmed info updates embeddings."""
+        """Encode one sentence with the fully automatic non-interactive update flow.
+
+        The pipeline is fixed as:
+        question_what -> understand -> accept -> question(interact=False) ->
+        train_confirmed_info_pairs(confirmed_yes)
+        """
         what_result = self.question_what(
             sentence,
             time_position=time_position,
@@ -507,8 +510,6 @@ class HighLevelCommands:
                 "understand_result": None,
                 "accept_result": None,
                 "question_result": None,
-                "inf_answer_count": 0,
-                "inf_answers": [],
                 "confirmed_yes_count": 0,
                 "confirmed_yes": [],
                 "training_result": None,
@@ -524,29 +525,10 @@ class HighLevelCommands:
             yes_threshold=yes_threshold,
             no_threshold=no_threshold,
             auto_accept=auto_accept,
-            interact=interact,
+            interact=False,
         )
 
         confirmed_yes = list(question_result.get("confirmed_yes", []))
-        inf_answers = []
-        normalized_inf_answer = None if auto_inf_answer is None else str(auto_inf_answer).strip().lower()
-        if normalized_inf_answer not in {None, "yes", "y", "no", "n"}:
-            raise ValueError("auto_inf_answer must be one of: yes, y, no, n, or None")
-
-        if normalized_inf_answer in {"yes", "y", "no", "n"}:
-            for item in list(question_result.get("questions", [])):
-                if str(item.get("type")) != "inf_question":
-                    continue
-                answer_result = self.answer_inf_question(
-                    item,
-                    normalized_inf_answer,
-                    event_surprise_target=event_surprise_target,
-                    step_scale=step_scale,
-                )
-                inf_answers.append(answer_result)
-                if bool(answer_result.get("accepted")):
-                    confirmed_yes.extend(list(answer_result.get("confirmed_yes", [])))
-
         training_result = self.train_confirmed_info_pairs(
             confirmed_yes,
             instance_epochs=instance_epochs,
@@ -566,8 +548,6 @@ class HighLevelCommands:
             "understand_result": understand_result,
             "accept_result": accept_result,
             "question_result": question_result,
-            "inf_answer_count": len(inf_answers),
-            "inf_answers": inf_answers,
             "confirmed_yes_count": len(confirmed_yes),
             "confirmed_yes": confirmed_yes,
             "training_result": training_result,
