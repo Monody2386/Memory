@@ -1,6 +1,6 @@
 # Project Structure
 
-This project is organized into three Python packages plus a small set of
+This project is organized into Python packages plus a small set of
 root-level compatibility wrappers.
 
 ## Packages
@@ -18,21 +18,33 @@ root-level compatibility wrappers.
 
 ### `world/`
 
-- `world/shortmemory.py`
-  Defines `ScoredTensorQueue` for short-term memory storage.
 - `world/world_model.py`
   Defines the attention-based action models and the `WorldModel` wrapper.
 - `world/train_world_model.py`
   Provides training loops for world-model samples, with optional validation.
 
+### `short_memory/`
+
+- `short_memory/shortmemory.py`
+  Defines `ShortMemory`, `ScoredTensorQueue`, and the event/relation/reward/surprise memory entries.
+- `world/shortmemory.py`
+  Compatibility wrapper that re-exports the standalone short-memory package for older imports.
+
+### `grammar_layer/`
+
+- `grammar_layer/grammar.py`
+  Defines the rule-based tokenizer, part-of-speech tagging, sentence extraction, instance resolution, and short-memory conversion helpers.
+- `grammar_layer/grammar_routes.py`
+  Defines the sentence pattern routing table used by the grammar extractor.
+- `prototype/grammar.py` and `prototype/grammar_routes.py`
+  Compatibility wrappers that re-export the standalone grammar layer for older imports.
+
 ### `prototype/`
 
 - `prototype/consciousness.py`
-  Placeholder for question handling and retrieval logic.
+  High-level controller for question handling, memory inspection, learning, and world-model interaction.
 - `prototype/episode_memory.py`
   Prototype episodic memory container.
-- `prototype/grammar.py`
-  Placeholder for event parsing and grammar handling.
 - `prototype/event_model.py`
   Empty placeholder.
 - `prototype/train_data_generator.py`

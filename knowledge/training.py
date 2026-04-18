@@ -52,8 +52,12 @@ def end_feed_training():
 
 
 def run_long_training_and_save():
-    _load_training_state()
-    relation_map, _, _, lr_per_embedding, lr_relation = rm.load_relation_data()
+    if not _FEED_TRAIN_READY:
+        _load_training_state()
+
+    relation_map = rm.relation_map
+    lr_per_embedding = rm.lr_per_embedding
+    lr_relation = rm.lr_relation
     train_average(knowledge_map_one, relation_map, lr_per_embedding, lr_relation)
     rm.save_relation_data()
     torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
@@ -173,7 +177,7 @@ def train_sentence_online(
     infer_missing=False,
     save=True,
 ):
-    grammar = importlib.import_module("prototype.grammar")
+    grammar = importlib.import_module("grammar_layer")
     samples = grammar.sentence_to_knowledge_samples(
         sentence,
         noun_relation_type=noun_relation_type,

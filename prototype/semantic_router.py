@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 from knowledge import adj_relation_map as arm
 from knowledge import relation_map as rm
 from knowledge.training import apply_language_training_samples
-from .grammar import (
+from grammar_layer import (
     AdjNounRelationSample,
     KnowledgeTrainingSamples,
     NounActionPair,

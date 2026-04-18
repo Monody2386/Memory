@@ -8,7 +8,7 @@ from .action_vocab import (
     get_full_action_type_list,
     set_action_list,
 )
-from .shortmemory import ScoredTensorQueue, short_memory
+from short_memory import ScoredTensorQueue, short_memory
 from .world_model import (
     ActionModel,
     Action_list,

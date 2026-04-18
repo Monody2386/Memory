@@ -1,1 +1,1 @@
-from world.shortmemory import *  # noqa: F401,F403
+from short_memory.shortmemory import *  # noqa: F401,F403

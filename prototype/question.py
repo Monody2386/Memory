@@ -131,7 +131,7 @@ class QuestionEngine:
         relation_tokens = set()
         for relation in rm.relation_list:
             relation_tokens.update(relation.lower().split())
-        grammar = importlib.import_module("prototype.grammar")
+        grammar = importlib.import_module("grammar_layer")
         adjective_hints = set(grammar.ADJECTIVE_RELATION_HINTS.keys())
         return {
             "nouns": {noun.lower() for noun in rm.noun_list},

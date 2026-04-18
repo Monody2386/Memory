@@ -1,1 +1,1 @@
-from prototype.grammar import *  # noqa: F401,F403
+from grammar_layer import *  # noqa: F401,F403

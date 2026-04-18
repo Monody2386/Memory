@@ -96,31 +96,51 @@ def train_average(
     relation_map,
     lr_per_embedding,
     lr_relation,
+    epochs=100,
     lr_decay_embedding=0.95,
     lr_decay_relation=0.95,
     min_lr=1e-6,
 ):
     optimizer = torch.optim.Adam(knowledge_map_one.parameters(), lr=0.001)
-    optimizer.zero_grad()
     involved_nouns = set()
     involved_relation_indices = set()
+    relation_entries = list(iter_active_relations(relation_map, len(knowledge_map_one.relations)))
 
-    for i, j, relation_type in iter_active_relations(relation_map, len(knowledge_map_one.relations)):
-        involved_nouns.update((i, j))
-        rel_idx = relation_type_to_index(relation_type, len(knowledge_map_one.relations))
-        involved_relation_indices.add(rel_idx)
+    if not relation_entries:
+        return 0.0
 
-        y_pred, y_target = knowledge_map_one(torch.tensor(i), torch.tensor(j), relation_type)
-        loss = F.mse_loss(y_pred, y_target)
+    last_loss = None
+    device = next(knowledge_map_one.parameters()).device
+
+    for _ in range(int(epochs)):
+        optimizer.zero_grad()
+        losses = []
+
+        for i, j, relation_type in relation_entries:
+            involved_nouns.update((i, j))
+            rel_idx = relation_type_to_index(relation_type, len(knowledge_map_one.relations))
+            involved_relation_indices.add(rel_idx)
+
+            y_pred, y_target = knowledge_map_one(
+                torch.tensor(i, dtype=torch.long, device=device),
+                torch.tensor(j, dtype=torch.long, device=device),
+                relation_type,
+            )
+            losses.append(F.mse_loss(y_pred, y_target))
+
+        loss = torch.stack(losses).mean()
         loss.backward()
 
-    with torch.no_grad():
-        scale_row_gradients(knowledge_map_one.embedding.weight.grad, lr_per_embedding)
-        scale_relation_gradients(knowledge_map_one.relations, lr_relation)
+        with torch.no_grad():
+            scale_row_gradients(knowledge_map_one.embedding.weight.grad, lr_per_embedding)
+            scale_relation_gradients(knowledge_map_one.relations, lr_relation)
 
-    optimizer.step()
+        optimizer.step()
+        last_loss = float(loss.item())
+
     decay_learning_rates(lr_per_embedding, involved_nouns, lr_decay_embedding, min_lr)
     decay_learning_rates(lr_relation, involved_relation_indices, lr_decay_relation, min_lr)
+    return last_loss if last_loss is not None else 0.0
 
 
 def save_all(knowledge_map_one, model_path):

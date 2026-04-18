@@ -4,7 +4,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 
-from .shortmemory import ScoredTensorQueue
+from short_memory import ScoredTensorQueue
 
 
 def _wm():

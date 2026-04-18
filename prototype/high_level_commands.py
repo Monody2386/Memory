@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .consciousness import Consciousness
-from .grammar import parse_sentence
+from grammar_layer import parse_sentence
 
 
 @dataclass

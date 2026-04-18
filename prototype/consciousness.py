@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 import torch
 
 from knowledge.relation_map import relation_map
-from world.shortmemory import ShortMemory
+from short_memory import ShortMemory
 from world.world_model import (
     WorldModel,
     action_dim,
@@ -84,7 +84,7 @@ class Consciousness:
     def _grammar(self):
         import importlib
 
-        return importlib.import_module("prototype.grammar")
+        return importlib.import_module("grammar_layer")
 
     def _sync_world_model_with_actions(self, required_actions: Optional[Sequence[str]] = None):
         import importlib
@@ -1433,7 +1433,7 @@ class Consciousness:
         """
         import importlib
 
-        grammar = importlib.import_module("prototype.grammar")
+        grammar = importlib.import_module("grammar_layer")
         adjective = str(adjective).lower()
         relation_name = str(relation_name).lower()
         self.question.register_token_pos(adjective, "adj", save=save)

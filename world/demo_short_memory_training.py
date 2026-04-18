@@ -6,7 +6,7 @@ import torch
 if __package__ is None or __package__ == "":
     sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-from world.shortmemory import ScoredTensorQueue
+from short_memory import ScoredTensorQueue
 from world.world_model import (
     WorldModel,
     action_dim,
