@@ -5,7 +5,7 @@ import torch
 
 rm = importlib.import_module("knowledge.relation_map")
 arm = importlib.import_module("knowledge.adj_relation_map")
-from .adj_map import adj_map, train_adj_random, train_joint_average
+from .adj_map import adj_map, train_adj_average, train_adj_random, train_joint_average
 from .knowledge_map import knowledge_map, train_average, train_random
 
 knowledge_map_one = knowledge_map(rm.noun_dim, rm.noun_dim)
@@ -63,6 +63,28 @@ def run_long_training_and_save():
     torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
 
 
+def run_adj_long_training_and_save():
+    if not _FEED_TRAIN_READY:
+        _load_training_state()
+
+    if not arm.adjective_list:
+        arm.save_adj_relation_data()
+        arm.load_adj_relation_data()
+
+    loss = train_adj_average(
+        adj_map_one,
+        arm.adj_relation_map,
+        rm.lr_per_embedding,
+        arm.lr_per_adjective,
+        arm.lr_adj_relation,
+    )
+    rm.save_relation_data()
+    arm.save_adj_relation_data()
+    torch.save(knowledge_map_one.state_dict(), MODEL_PATH)
+    torch.save(adj_map_one.state_dict(), ADJ_MODEL_PATH)
+    return loss
+
+
 def run_joint_training_and_save():
     _load_training_state()
     relation_map, _, _, lr_per_embedding, lr_relation = rm.load_relation_data()
@@ -72,7 +94,7 @@ def run_joint_training_and_save():
             "adj_relation_data.npz not found. Generate adjective relation data before joint training."
         )
 
-    train_joint_average(
+    loss = train_joint_average(
         knowledge_map_one=knowledge_map_one,
         adj_map_one=adj_map_one,
         relation_map=relation_map,
@@ -83,6 +105,7 @@ def run_joint_training_and_save():
         lr_adj_relation=lr_adj_relation,
     )
     _save_training_state()
+    return loss
 
 
 def run_short_training_and_save(relation_learn, save=True):

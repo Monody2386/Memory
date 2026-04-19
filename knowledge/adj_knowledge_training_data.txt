@@ -1,0 +1,103 @@
+# One triple per line:
+# <noun> <adj_relation> <adjective>
+#
+# You can edit this file and run:
+#   python Train_adj_knowledge.py
+#
+# Existing adj relation conflicts are kept by default in file training.
+
+# noun: apple
+apple color red
+apple shape round
+apple taste sweet
+apple size small
+apple texture smooth
+
+# noun: banana
+banana color yellow
+banana shape long
+banana taste sweet
+banana size medium
+banana texture smooth
+
+# noun: grape
+grape color purple
+grape shape round
+grape taste sweet
+grape size small
+grape texture smooth
+
+# noun: lemon
+lemon color yellow
+lemon shape round
+lemon taste sour
+lemon size small
+lemon texture smooth
+
+# noun: mango
+mango color yellow
+mango shape round
+mango taste sweet
+mango size medium
+mango texture smooth
+
+# noun: melon
+melon color green
+melon shape round
+melon taste sweet
+melon size large
+melon texture smooth
+
+# noun: orange
+orange color orange
+orange shape round
+orange taste sweet
+orange size medium
+orange texture smooth
+
+# noun: peach
+peach color orange
+peach shape round
+peach taste sweet
+peach size medium
+peach texture soft
+
+# noun: pear
+pear color green
+pear shape round
+pear taste sweet
+pear size medium
+pear texture smooth
+
+# noun: pineapple
+pineapple color yellow
+pineapple shape long
+pineapple taste sweet
+pineapple size large
+pineapple texture rough
+
+# noun: strawberry
+strawberry color red
+strawberry shape round
+strawberry taste sweet
+strawberry size small
+strawberry texture soft
+
+# noun: water
+water temperature cold
+water texture smooth
+
+# noun: fire
+fire color red
+fire temperature hot
+
+# noun: elephant
+elephant size large
+
+# noun: chair
+chair size medium
+chair texture smooth
+
+# noun: sofa
+sofa size large
+sofa texture soft

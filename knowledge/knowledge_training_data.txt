@@ -1,0 +1,273 @@
+# One triple per line:
+# <noun1> <relation> <noun2>
+#
+# You can edit this file and run:
+#   python Train_knowledge.py
+#
+# Existing relation conflicts are kept by default in file training.
+# The triples below are grouped by noun1 for easier editing.
+
+# Concept groups
+
+# noun1: object
+object include bottle
+object include book
+object include bowl
+object include car
+object include chair
+object include coat
+object include computer
+object include cup
+object include hat
+object include laptop
+object include pants
+object include phone
+object include shirt
+object include shoes
+object include sofa
+object include spoon
+object include table
+object include tablet
+object include water
+
+# noun1: animal
+animal include bear
+animal include bird
+animal include cat
+animal include dog
+animal include elephant
+animal include fish
+animal include fox
+animal include horse
+animal include human
+animal include lion
+animal include monkey
+animal include rabbit
+animal include sheep
+animal include tiger
+animal include whale
+animal include wolf
+
+# noun1: fruit
+fruit include apple
+fruit include grape
+fruit include banana
+fruit include lemon
+fruit include mango
+fruit include melon
+fruit include orange
+fruit include peach
+fruit include pear
+fruit include pineapple
+fruit include strawberry
+
+# noun1: food
+food include apple
+food include banana
+food include bread
+food include fruit
+food include grape
+food include lemon
+food include mango
+food include melon
+food include orange
+food include peach
+food include pear
+food include pineapple
+food include rice
+food include strawberry
+
+# noun1: container
+container include bottle
+container include bowl
+container include cup
+
+# noun1: clothes
+clothes include coat
+clothes include hat
+clothes include pants
+clothes include shirt
+clothes include shoes
+
+# noun1: electronic
+electronic include computer
+electronic include laptop
+electronic include phone
+electronic include tablet
+
+# noun1: furniture
+furniture include chair
+furniture include sofa
+furniture include table
+
+# noun1: tool
+tool include spoon
+
+# noun1: vehicle
+vehicle include car
+
+# Instance groups
+
+# noun1: air
+air belong to object
+
+# noun1: apple
+apple belong to fruit
+
+# noun1: banana
+banana belong to fruit
+
+# noun1: bear
+bear belong to animal
+
+# noun1: bird
+bird belong to animal
+
+# noun1: bottle
+bottle belong to container
+bottle belong to object
+
+# noun1: book
+book belong to object
+
+# noun1: bowl
+bowl belong to container
+bowl belong to object
+
+# noun1: car
+car belong to object
+car belong to vehicle
+
+# noun1: cat
+cat belong to animal
+
+# noun1: chair
+chair belong to furniture
+chair belong to object
+
+# noun1: coat
+coat belong to clothes
+coat belong to object
+
+# noun1: computer
+computer belong to electronic
+computer belong to object
+
+# noun1: cup
+cup belong to container
+cup belong to object
+
+# noun1: dog
+dog belong to animal
+
+# noun1: elephant
+elephant belong to animal
+
+# noun1: fire
+fire belong to object
+
+# noun1: fish
+fish belong to animal
+
+# noun1: fox
+fox belong to animal
+
+# noun1: grape
+grape belong to fruit
+
+# noun1: hat
+hat belong to clothes
+hat belong to object
+
+# noun1: horse
+horse belong to animal
+
+# noun1: human
+human belong to animal
+
+# noun1: laptop
+laptop belong to electronic
+laptop belong to object
+
+# noun1: lemon
+lemon belong to fruit
+
+# noun1: lion
+lion belong to animal
+
+# noun1: mango
+mango belong to fruit
+
+# noun1: melon
+melon belong to fruit
+
+# noun1: monkey
+monkey belong to animal
+
+# noun1: orange
+orange belong to fruit
+
+# noun1: pants
+pants belong to clothes
+pants belong to object
+
+# noun1: peach
+peach belong to fruit
+
+# noun1: pear
+pear belong to fruit
+
+# noun1: pineapple
+pineapple belong to fruit
+
+# noun1: phone
+phone belong to electronic
+phone belong to object
+
+# noun1: rabbit
+rabbit belong to animal
+
+# noun1: sheep
+sheep belong to animal
+
+# noun1: shirt
+shirt belong to clothes
+shirt belong to object
+
+# noun1: shoes
+shoes belong to clothes
+shoes belong to object
+
+# noun1: sofa
+sofa belong to furniture
+sofa belong to object
+
+# noun1: spoon
+spoon belong to object
+spoon belong to tool
+
+# noun1: strawberry
+strawberry belong to fruit
+
+# noun1: table
+table belong to furniture
+table belong to object
+
+# noun1: tablet
+tablet belong to electronic
+tablet belong to object
+
+# noun1: teacher
+teacher belong to job
+
+# noun1: tiger
+tiger belong to animal
+
+# noun1: water
+water belong to object
+
+# noun1: whale
+whale belong to animal
+
+# noun1: wolf
+wolf belong to animal

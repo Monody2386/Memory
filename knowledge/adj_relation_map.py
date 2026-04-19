@@ -9,6 +9,8 @@ from ._storage_utils import ensure_vector_capacity
 adjective_number = 200
 adjective_dim = noun_rm.noun_dim
 adj_relation_num = 7
+ADJECTIVE_EMBEDDING_LR = 1e-6
+ADJ_RELATION_LR = 1e-6
 
 DEFAULT_ADJECTIVES = [
     "red",
@@ -31,14 +33,16 @@ DEFAULT_ADJ_RELATIONS = [
 adj_relation_map = np.zeros((noun_rm.noun_number, adjective_number), dtype=np.int64)
 adjective_list = list(DEFAULT_ADJECTIVES)
 adj_relation_list = list(DEFAULT_ADJ_RELATIONS)
-lr_per_adjective = np.ones(adjective_number)
-lr_adj_relation = np.ones(adj_relation_num)
+lr_per_adjective = np.full(adjective_number, ADJECTIVE_EMBEDDING_LR)
+lr_adj_relation = np.full(adj_relation_num, ADJ_RELATION_LR)
 
 
 def _ensure_adj_capacity() -> None:
     global lr_per_adjective, lr_adj_relation
     lr_per_adjective = ensure_vector_capacity(lr_per_adjective, adjective_number)
+    lr_per_adjective.fill(ADJECTIVE_EMBEDDING_LR)
     lr_adj_relation = ensure_vector_capacity(lr_adj_relation, adj_relation_num)
+    lr_adj_relation.fill(ADJ_RELATION_LR)
 
 
 def _placeholder_name(index: int) -> str:
@@ -141,7 +145,9 @@ def load_adj_relation_data(file_path="adj_relation_data.npz"):
     adjective_list = data["adjective_list"].tolist()
     adj_relation_list = data["adj_relation_list"].tolist()
     lr_per_adjective = ensure_vector_capacity(data["lr_per_adjective"], adjective_number)
+    lr_per_adjective.fill(ADJECTIVE_EMBEDDING_LR)
     lr_adj_relation = ensure_vector_capacity(data["lr_adj_relation"], adj_relation_num)
+    lr_adj_relation.fill(ADJ_RELATION_LR)
 
     return (
         adj_relation_map,
