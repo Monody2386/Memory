@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import importlib
 import pathlib
+import sys
 
-from .training import (
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from knowledge.training import (
     ADJ_MODEL_PATH,
     MODEL_PATH,
     adj_map_one,

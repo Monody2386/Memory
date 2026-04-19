@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import pathlib
+import sys
 
-from .training import ADJ_MODEL_PATH, MODEL_PATH, run_joint_training_and_save
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from knowledge.training import ADJ_MODEL_PATH, MODEL_PATH, run_joint_training_and_save
 
 rm = importlib.import_module("knowledge.relation_map")
 arm = importlib.import_module("knowledge.adj_relation_map")

@@ -8,6 +8,7 @@
 
 # noun: apple
 apple color red
+apple color green
 apple shape round
 apple taste sweet
 apple size small

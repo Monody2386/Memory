@@ -1,12 +1,16 @@
 import importlib
 import os
 import pathlib
+import sys
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
 rm = importlib.import_module("knowledge.relation_map")
-from .knowledge_map import knowledge_map
-from .training import (
+from knowledge.knowledge_map import knowledge_map
+from knowledge.training import (
     begin_feed_training,
     run_long_training_and_save,
     run_short_training_and_save,
