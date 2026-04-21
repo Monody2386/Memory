@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .action_vocab import get_full_action_type_list, set_action_list
+from .world_model_stages import ActionModel
 
 attention_dim = 100
 action_dim = 80
@@ -48,48 +49,6 @@ class PredictedEvent:
             "score": self.score,
             "polarity": self.polarity,
         }
-
-
-class ActionModel(nn.Module):
-    def __init__(self, noun_dim, action_dim, attention_dim, value_dim, hidden_dim):
-        super(ActionModel, self).__init__()
-        self.Wq = nn.Linear(noun_dim + action_dim, attention_dim)
-        self.Wk = nn.Linear(noun_dim + action_dim, attention_dim)
-        self.Wv = nn.Linear(noun_dim + action_dim, value_dim)
-        self.scale = attention_dim ** 0.5
-        self.action_predict = nn.Sequential(
-            nn.Linear(value_dim, hidden_dim, bias=False),
-            nn.Linear(hidden_dim, action_dim, bias=False),
-        )
-
-    def integrate_attention(self, x):
-        """Integrate short-memory events into one context vector.
-
-        Input:
-            x: event sequence shaped [batch, event_count, noun_dim + action_dim].
-        Output:
-            tensor: context vector shaped [batch, value_dim].
-        """
-        input_prefix = x[:, :-1, :]
-        input_suffix = x[:, -1, :]
-
-        q = self.Wq(input_suffix)
-        k = self.Wk(input_prefix)
-        v = self.Wv(input_prefix)
-
-        scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) / self.scale
-        attention_weight = F.softmax(scores, dim=-1)
-        output = torch.matmul(attention_weight, v).squeeze(1)
-        output = output + self.Wv(input_suffix)
-        return output
-
-    def predict_action_from_context(self, context):
-        """Predict the next action embedding from an integrated context vector."""
-        return self.action_predict(context)
-
-    def forward(self, x):
-        context = self.integrate_attention(x)
-        return self.predict_action_from_context(context)
 
 
 class WorldModel(nn.Module):
@@ -212,20 +171,45 @@ class WorldModel(nn.Module):
         return model_input
 
     def forward(self, input_2d: torch.Tensor, action_type: int) -> torch.Tensor:
+        context = self.encode_sequence_context(input_2d, action_type)
+        return self.predict_action_from_context(context, action_type)
+
+    def encode_sequence_context(self, input_2d: torch.Tensor, action_type: int) -> torch.Tensor:
+        """Compress an event sequence into one context vector.
+
+        This is the first world-model stage. It is intentionally exposed so a
+        future model can replace sequence compression without changing the
+        action-prediction head contract.
+        """
         action_idx = self.action_type_to_idx(action_type)
         model_input = self._prepare_model_input(input_2d)
 
         device = next(self.action_models[action_idx].parameters()).device
         model_input = model_input.to(device)
-        new_action = self.action_models[action_idx](model_input)
+        return self.action_models[action_idx].encode_sequence_context(model_input)
+
+    def predict_action_from_context(self, context: torch.Tensor, action_type: int) -> torch.Tensor:
+        """Predict the next action embedding from a precomputed context vector.
+
+        This is the second world-model stage. It is separate from sequence
+        compression so the prediction head can be swapped independently.
+        """
+        action_idx = self.action_type_to_idx(action_type)
+        device = next(self.action_models[action_idx].parameters()).device
+        context = context.to(device)
+        new_action = self.action_models[action_idx].predict_action_from_context(context)
         return new_action.squeeze(0)
 
     def predict_from_short_memory(self, short_memory, action_type: int, steps=None):
-        memory_input = short_memory.build_world_model_input(steps=steps)
+        if hasattr(short_memory, "build_event_sequence_tensor"):
+            memory_input = short_memory.build_event_sequence_tensor(steps=steps)
+        else:
+            memory_input = short_memory.build_world_model_input(steps=steps)
         if memory_input.numel() == 0:
             raise ValueError("short_memory is empty")
         focus_entry = short_memory.get_focus_entry(steps=steps)
-        pred_action = self.forward(memory_input, action_type)
+        context = self.encode_sequence_context(memory_input, action_type)
+        pred_action = self.predict_action_from_context(context, action_type)
         pred_action_type = self.nearest_action_type(pred_action)
         focus_noun_embedding = None
         focus_noun_instance_id = None
@@ -235,6 +219,7 @@ class WorldModel(nn.Module):
             focus_noun_instance_id = focus_entry.noun_instance_id
             focus_action_instance_id = focus_entry.action_instance_id
         return {
+            "context": context.detach(),
             "pred_action": pred_action,
             "pred_action_type": pred_action_type,
             "focus_noun_embedding": focus_noun_embedding,
