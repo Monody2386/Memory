@@ -8,6 +8,7 @@ from .shortmemory import (
     SurpriseMemoryEntry,
     short_memory,
 )
+from .space_state import SpaceState, SpatialFact, SpatialPatch
 
 __all__ = [
     "EventMemoryEntry",
@@ -15,6 +16,9 @@ __all__ = [
     "RelationMemoryEntry",
     "RewardMemoryEntry",
     "ScoredTensorQueue",
+    "SpaceState",
+    "SpatialFact",
+    "SpatialPatch",
     "ShortMemory",
     "SurpriseMemoryEntry",
     "short_memory",

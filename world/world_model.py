@@ -1,18 +1,30 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .action_vocab import get_full_action_type_list, set_action_list
-from .world_model_stages import ActionModel
 
 attention_dim = 100
 action_dim = 80
 noun_dim = 50
 value_dim = 100
 hidden_dim = 50
+
+
+class WorldModelResetError(NotImplementedError):
+    """Raised when code tries to use the removed legacy world-model pipeline."""
+
+
+def _reset_message(method_name: str) -> str:
+    return (
+        f"Legacy world-model logic has been cleared. `{method_name}` is intentionally unavailable "
+        "until the new world_state/event_state world model is implemented."
+    )
 
 
 @dataclass
@@ -51,46 +63,203 @@ class PredictedEvent:
         }
 
 
+@dataclass
+class InstanceUpdateResult:
+    noun_instance_id: str
+    noun_type: Optional[int]
+    action_type: int
+    action_instance_id: Optional[str]
+    old_embedding: torch.Tensor
+    new_embedding: torch.Tensor
+    time_position: Optional[int]
+    event_index: Optional[int]
+    pair_index: Optional[int]
+    score: float
+
+    def as_dict(self):
+        return {
+            "noun_instance_id": self.noun_instance_id,
+            "noun_type": self.noun_type,
+            "action_type": self.action_type,
+            "action_instance_id": self.action_instance_id,
+            "old_embedding": self.old_embedding,
+            "new_embedding": self.new_embedding,
+            "time_position": self.time_position,
+            "event_index": self.event_index,
+            "pair_index": self.pair_index,
+            "score": self.score,
+        }
+
+
+@dataclass
+class SpaceUpdateResult:
+    source_instance_id: str
+    target_instance_id: str
+    action_space_type: int
+    action_space_name: str
+    relation: str
+    time_position: Optional[int]
+    event_index: Optional[int]
+    pair_index: Optional[int]
+    score: float
+    replace_family: bool
+
+    def as_dict(self):
+        return {
+            "source_instance_id": self.source_instance_id,
+            "target_instance_id": self.target_instance_id,
+            "action_space_type": self.action_space_type,
+            "action_space_name": self.action_space_name,
+            "relation": self.relation,
+            "time_position": self.time_position,
+            "event_index": self.event_index,
+            "pair_index": self.pair_index,
+            "score": self.score,
+            "replace_family": self.replace_family,
+        }
+
+
+class ActionModel(nn.Module):
+    """Legacy placeholder kept only so old imports fail clearly."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        raise WorldModelResetError(_reset_message("ActionModel.__init__"))
+
+
 class WorldModel(nn.Module):
+    """Reset baseline for the next world-model redesign.
+
+    The old action-sequence predictor has been removed on purpose. This class
+    currently preserves only action-vocabulary utilities and compatibility
+    fields so the rest of the project can evolve toward the new
+    world_state/event_state design without inheriting the previous logic.
+    """
+
     def __init__(
         self,
-        noun_dim,
-        action_dim,
-        attention_dim,
-        value_dim,
-        hidden_dim,
-        action_names=None,
-        action_lrs=None,
+        noun_dim: int,
+        action_dim: int,
+        attention_dim: int,
+        value_dim: int,
+        hidden_dim: int,
+        action_names: Optional[Sequence[str]] = None,
+        action_space_names: Optional[Sequence[str]] = None,
+        action_space_relations: Optional[Dict[str, str]] = None,
+        action_lrs: Optional[Sequence[float]] = None,
     ):
-        super(WorldModel, self).__init__()
-        self.noun_dim = noun_dim
-        self.action_dim = action_dim
-        self.attention_dim = attention_dim
-        self.value_dim = value_dim
-        self.hidden_dim = hidden_dim
+        super().__init__()
+        self.noun_dim = int(noun_dim)
+        self.action_dim = int(action_dim)
+        self.attention_dim = int(attention_dim)
+        self.value_dim = int(value_dim)
+        self.hidden_dim = int(hidden_dim)
 
         if action_names is not None:
             set_action_list(action_names)
 
-        self.action_list = get_full_action_type_list()
+        self.action_list = list(get_full_action_type_list())
         self.model_count = len(self.action_list) - 1
-        self.action_models = nn.ModuleList(
-            [
-                ActionModel(noun_dim, action_dim, attention_dim, value_dim, hidden_dim)
-                for _ in range(self.model_count)
-            ]
-        )
         self.action_embeddings = nn.Embedding(len(self.action_list), self.action_dim)
-
+        self.action_space_list = self._build_action_space_list(action_space_names)
+        self.action_space_count = len(self.action_space_list) - 1
+        self.action_space_embeddings = nn.Embedding(len(self.action_space_list), self.action_dim)
+        self.action_space_relation_map = self._build_action_space_relation_map(action_space_relations)
+        self.instance_transforms = nn.ModuleList(
+            [nn.Linear(self.noun_dim, self.noun_dim) for _ in range(self.model_count)]
+        )
         with torch.no_grad():
             self.action_embeddings.weight[0].zero_()
+            self.action_space_embeddings.weight[0].zero_()
 
         if action_lrs is None:
-            self.action_learning_rates = [1e-3] + [1e-4] * max(0, self.model_count - 1)
+            self.action_learning_rates = [1e-3] * len(self.action_list)
         else:
-            if len(action_lrs) != self.model_count:
-                raise ValueError("action_lrs length must match the number of trainable action models")
             self.action_learning_rates = [float(lr) for lr in action_lrs]
+
+        self.action_models = nn.ModuleList()
+
+    def _build_action_space_list(self, action_space_names: Optional[Sequence[str]]) -> list[str]:
+        if action_space_names is None:
+            return ["no_space_action"]
+        normalized = []
+        for action_name in action_space_names:
+            action_name = str(action_name).lower()
+            if action_name == "no_space_action":
+                continue
+            if action_name not in normalized:
+                normalized.append(action_name)
+        return ["no_space_action"] + normalized
+
+    def _build_action_space_relation_map(
+        self,
+        action_space_relations: Optional[Dict[str, str]],
+    ) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for action_name in self.action_space_list[1:]:
+            mapping[action_name] = action_name
+        if action_space_relations:
+            for action_name, relation_name in action_space_relations.items():
+                mapping[str(action_name).lower()] = str(relation_name).lower()
+        return mapping
+
+    def sync_action_list(self, action_names: Sequence[str]) -> None:
+        old_action_list = list(self.action_list)
+        old_embeddings = self.action_embeddings
+        old_transforms = self.instance_transforms
+        set_action_list(action_names)
+        self.action_list = list(get_full_action_type_list())
+        self.model_count = len(self.action_list) - 1
+        self.action_embeddings = nn.Embedding(len(self.action_list), self.action_dim)
+        self.instance_transforms = nn.ModuleList(
+            [nn.Linear(self.noun_dim, self.noun_dim) for _ in range(self.model_count)]
+        )
+
+        old_index = {name.lower(): idx for idx, name in enumerate(old_action_list)}
+        with torch.no_grad():
+            for new_idx, action_name in enumerate(self.action_list):
+                old_idx = old_index.get(action_name.lower())
+                if old_idx is not None and old_idx < old_embeddings.weight.shape[0]:
+                    self.action_embeddings.weight[new_idx].copy_(old_embeddings.weight[old_idx])
+                if (
+                    old_idx is not None
+                    and old_idx != 0
+                    and (old_idx - 1) < len(old_transforms)
+                    and (new_idx - 1) < len(self.instance_transforms)
+                ):
+                    self.instance_transforms[new_idx - 1].load_state_dict(
+                        old_transforms[old_idx - 1].state_dict()
+                    )
+            self.action_embeddings.weight[0].zero_()
+
+    def sync_action_space_list(
+        self,
+        action_space_names: Sequence[str],
+        action_space_relations: Optional[Dict[str, str]] = None,
+    ) -> None:
+        old_action_space_list = list(self.action_space_list)
+        old_embeddings = self.action_space_embeddings
+        self.action_space_list = self._build_action_space_list(action_space_names)
+        self.action_space_count = len(self.action_space_list) - 1
+        self.action_space_embeddings = nn.Embedding(len(self.action_space_list), self.action_dim)
+        self.action_space_relation_map = self._build_action_space_relation_map(action_space_relations)
+
+        old_index = {name.lower(): idx for idx, name in enumerate(old_action_space_list)}
+        with torch.no_grad():
+            for new_idx, action_name in enumerate(self.action_space_list):
+                old_idx = old_index.get(action_name.lower())
+                if old_idx is not None and old_idx < old_embeddings.weight.shape[0]:
+                    self.action_space_embeddings.weight[new_idx].copy_(old_embeddings.weight[old_idx])
+            self.action_space_embeddings.weight[0].zero_()
+
+    def build_optimizer(self):
+        return torch.optim.Adam(
+            [
+                {"params": self.action_embeddings.parameters(), "lr": 1e-3},
+                {"params": self.action_space_embeddings.parameters(), "lr": 1e-3},
+                {"params": self.instance_transforms.parameters(), "lr": 1e-3},
+            ]
+        )
 
     def action_type_to_idx(self, action_type: int) -> int:
         action_type = int(action_type)
@@ -100,33 +269,54 @@ class WorldModel(nn.Module):
             )
         return action_type - 1
 
-    def action_idx_to_type(self, action_idx: int) -> int:
-        action_idx = int(action_idx)
-        if action_idx < 0 or action_idx >= self.model_count:
-            raise ValueError(f"action_idx {action_idx} out of range [0, {self.model_count - 1}]")
-        return action_idx + 1
-
-    def _normalize_embedding_action_type(self, action_type: int) -> int:
-        action_type = int(action_type)
-        if action_type < 0 or action_type > self.model_count:
-            raise ValueError(
-                f"action_type {action_type} out of range [0, {self.model_count}]"
-            )
-        return action_type
-
-    def build_optimizer(self):
-        action_param_groups = [
-            {"params": action_model.parameters(), "lr": lr}
-            for action_model, lr in zip(self.action_models, self.action_learning_rates)
-        ]
-        action_param_groups.append({"params": self.action_embeddings.parameters(), "lr": 1e-3})
-        return torch.optim.Adam(action_param_groups)
-
     def get_action_embedding(self, action_type: int) -> torch.Tensor:
-        action_type = self._normalize_embedding_action_type(action_type)
+        action_type = int(action_type)
+        if action_type < 0 or action_type >= len(self.action_list):
+            raise ValueError(
+                f"action_type {action_type} out of range [0, {len(self.action_list) - 1}]"
+            )
         device = self.action_embeddings.weight.device
         action_type_tensor = torch.tensor(action_type, dtype=torch.long, device=device)
         return self.action_embeddings(action_type_tensor)
+
+    def action_space_type_to_idx(self, action_space_type: int) -> int:
+        action_space_type = int(action_space_type)
+        if action_space_type < 1 or action_space_type > self.action_space_count:
+            raise ValueError(
+                f"action_space_type {action_space_type} out of range [1, {self.action_space_count}] "
+                "with 0 reserved for no_space_action"
+            )
+        return action_space_type - 1
+
+    def get_action_space_embedding(self, action_space_type: int) -> torch.Tensor:
+        action_space_type = int(action_space_type)
+        if action_space_type < 0 or action_space_type >= len(self.action_space_list):
+            raise ValueError(
+                f"action_space_type {action_space_type} out of range [0, {len(self.action_space_list) - 1}]"
+            )
+        device = self.action_space_embeddings.weight.device
+        action_space_tensor = torch.tensor(action_space_type, dtype=torch.long, device=device)
+        return self.action_space_embeddings(action_space_tensor)
+
+    def get_action_space_name(self, action_space_type: int) -> str:
+        action_space_type = int(action_space_type)
+        if action_space_type < 0 or action_space_type >= len(self.action_space_list):
+            raise ValueError(
+                f"action_space_type {action_space_type} out of range [0, {len(self.action_space_list) - 1}]"
+            )
+        return self.action_space_list[action_space_type]
+
+    def resolve_action_space_relation(
+        self,
+        action_space_type: int,
+        relation: Optional[str] = None,
+    ) -> str:
+        if relation is not None:
+            return str(relation).lower()
+        action_space_name = self.get_action_space_name(action_space_type)
+        if action_space_name == "no_space_action":
+            raise ValueError("no_space_action does not map to a spatial relation")
+        return self.action_space_relation_map.get(action_space_name, action_space_name)
 
     def infer_action_type(self, action_tensor: torch.Tensor, top_k: int = 1, include_no_action: bool = False):
         if action_tensor.dim() > 1:
@@ -145,6 +335,9 @@ class WorldModel(nn.Module):
             embeddings = all_embeddings[1:]
             index_offset = 1
 
+        if embeddings.shape[0] == 0:
+            raise ValueError("no trainable action embeddings are registered")
+
         action_tensor = action_tensor.to(embeddings.device, dtype=embeddings.dtype)
         query = F.normalize(action_tensor.unsqueeze(0), dim=1)
         normalized_embeddings = F.normalize(embeddings, dim=1)
@@ -161,396 +354,272 @@ class WorldModel(nn.Module):
         )
         return int(top_indices[0].item())
 
-    def _prepare_model_input(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        if input_tensor.dim() == 2:
-            model_input = input_tensor.t().unsqueeze(0)
-        elif input_tensor.dim() == 3:
-            model_input = input_tensor
-        else:
-            raise ValueError("input tensor must be 2D or 3D")
-        return model_input
+    def forward(self, noun_embedding: torch.Tensor, action_type: int) -> torch.Tensor:
+        return self.transform_instance_embedding(noun_embedding, action_type)
 
-    def forward(self, input_2d: torch.Tensor, action_type: int) -> torch.Tensor:
-        context = self.encode_sequence_context(input_2d, action_type)
-        return self.predict_action_from_context(context, action_type)
-
-    def encode_sequence_context(self, input_2d: torch.Tensor, action_type: int) -> torch.Tensor:
-        """Compress an event sequence into one context vector.
-
-        This is the first world-model stage. It is intentionally exposed so a
-        future model can replace sequence compression without changing the
-        action-prediction head contract.
-        """
+    def transform_instance_embedding(self, noun_embedding: torch.Tensor, action_type: int) -> torch.Tensor:
+        if noun_embedding is None:
+            raise ValueError("noun_embedding is required")
         action_idx = self.action_type_to_idx(action_type)
-        model_input = self._prepare_model_input(input_2d)
+        transform = self.instance_transforms[action_idx]
+        device = next(transform.parameters()).device
+        noun_embedding = noun_embedding.to(device=device, dtype=transform.weight.dtype).view(-1)
+        if noun_embedding.numel() != self.noun_dim:
+            raise ValueError(
+                f"noun_embedding must have {self.noun_dim} values, got {noun_embedding.numel()}"
+            )
+        return transform(noun_embedding.unsqueeze(0)).squeeze(0)
 
-        device = next(self.action_models[action_idx].parameters()).device
-        model_input = model_input.to(device)
-        return self.action_models[action_idx].encode_sequence_context(model_input)
-
-    def predict_action_from_context(self, context: torch.Tensor, action_type: int) -> torch.Tensor:
-        """Predict the next action embedding from a precomputed context vector.
-
-        This is the second world-model stage. It is separate from sequence
-        compression so the prediction head can be swapped independently.
-        """
-        action_idx = self.action_type_to_idx(action_type)
-        device = next(self.action_models[action_idx].parameters()).device
-        context = context.to(device)
-        new_action = self.action_models[action_idx].predict_action_from_context(context)
-        return new_action.squeeze(0)
-
-    def predict_from_short_memory(self, short_memory, action_type: int, steps=None):
-        if hasattr(short_memory, "build_event_sequence_tensor"):
-            memory_input = short_memory.build_event_sequence_tensor(steps=steps)
-        else:
-            memory_input = short_memory.build_world_model_input(steps=steps)
-        if memory_input.numel() == 0:
-            raise ValueError("short_memory is empty")
-        focus_entry = short_memory.get_focus_entry(steps=steps)
-        context = self.encode_sequence_context(memory_input, action_type)
-        pred_action = self.predict_action_from_context(context, action_type)
-        pred_action_type = self.nearest_action_type(pred_action)
-        focus_noun_embedding = None
-        focus_noun_instance_id = None
-        focus_action_instance_id = None
-        if focus_entry is not None:
-            focus_noun_embedding = short_memory.get_noun_embedding(focus_entry.noun_instance_id)
-            focus_noun_instance_id = focus_entry.noun_instance_id
-            focus_action_instance_id = focus_entry.action_instance_id
-        return {
-            "context": context.detach(),
-            "pred_action": pred_action,
-            "pred_action_type": pred_action_type,
-            "focus_noun_embedding": focus_noun_embedding,
-            "focus_noun_type": None if focus_entry is None else focus_entry.noun_type,
-            "focus_action_type": None if focus_entry is None else focus_entry.action_type,
-            "focus_time_position": None if focus_entry is None else focus_entry.time_position,
-            "focus_pair_index": None if focus_entry is None else focus_entry.pair_index,
-            "focus_event_index": None if focus_entry is None else focus_entry.event_index,
-            "focus_polarity": 1 if focus_entry is None else int(getattr(focus_entry, "polarity", 1)),
-            "focus_noun_instance_id": focus_noun_instance_id,
-            "focus_action_instance_id": focus_action_instance_id,
-        }
-
-    def predict_next_event(self, short_memory, action_type: int, steps=None, score: float = 0.5):
-        prediction = self.predict_from_short_memory(short_memory, action_type=action_type, steps=steps)
-        pred_action_type = int(prediction["pred_action_type"])
-        pred_action_embedding = self.get_action_embedding(pred_action_type).detach().clone()
-        next_time_position = 0
-        if prediction["focus_time_position"] is not None:
-            next_time_position = int(prediction["focus_time_position"]) + 1
-
-        predicted_event = PredictedEvent(
-            noun_instance_id=prediction["focus_noun_instance_id"],
-            noun_type=prediction["focus_noun_type"],
-            noun_embedding=None if prediction["focus_noun_embedding"] is None else prediction["focus_noun_embedding"].detach().clone(),
-            action_instance_id=None,
-            action_type=pred_action_type,
-            action_embedding=pred_action_embedding,
-            source_action_type=prediction["focus_action_type"],
-            source_time_position=prediction["focus_time_position"],
-            source_pair_index=prediction["focus_pair_index"],
-            source_event_index=prediction["focus_event_index"],
-            time_position=next_time_position,
-            event_index=next_time_position,
-            score=float(score),
-            polarity=int(prediction.get("focus_polarity", 1)),
-        )
-        result = prediction.copy()
-        result["predicted_event"] = predicted_event
-        result["predicted_event_dict"] = predicted_event.as_dict()
-        return result
-
-    def append_predicted_event(
+    def update_instance_embedding(
         self,
         short_memory,
-        predicted_event,
+        noun_instance_id: str,
+        action_type: int,
         *,
-        pair_index=None,
-        noun_text=None,
-        action_text=None,
-        role="predicted",
-        pair_kind="noun_action",
-    ):
-        if isinstance(predicted_event, PredictedEvent):
-            event = predicted_event
-        else:
-            event = PredictedEvent(**predicted_event)
+        noun_type: Optional[int] = None,
+        noun_text: Optional[str] = None,
+        action_text: Optional[str] = None,
+        score: float = 0.5,
+        time_position: Optional[int] = None,
+        pair_index: Optional[int] = None,
+        event_index: Optional[int] = None,
+        action_instance_id: Optional[str] = None,
+        append_event: bool = True,
+    ) -> InstanceUpdateResult:
+        old_embedding = short_memory.get_noun_embedding(noun_instance_id)
+        if old_embedding is None:
+            raise ValueError(f"noun instance `{noun_instance_id}` is not stored in short_memory")
 
-        if event.noun_embedding is None:
-            raise ValueError("predicted_event requires noun_embedding to be written back")
+        if noun_type is None:
+            focus_entry = short_memory.get_focus_entry()
+            if focus_entry is not None and focus_entry.noun_instance_id == noun_instance_id:
+                noun_type = focus_entry.noun_type
 
-        resolved_pair_index = pair_index if pair_index is not None else len(short_memory.entries)
-        if event.action_instance_id is None:
-            event.action_instance_id = short_memory._default_action_instance_id(
-                event.action_type,
-                time_position=event.time_position,
-                pair_index=resolved_pair_index,
-            )
+        if noun_text is None:
+            metadata = short_memory.get_noun_instance_metadata(noun_instance_id)
+            if metadata is not None:
+                noun_text = metadata.get("noun_text")
 
-        short_memory.append_event(
-            noun_embedding=event.noun_embedding,
-            action_embedding=event.action_embedding,
-            score=event.score,
-            noun_type=event.noun_type,
-            action_type=event.action_type,
-            noun_instance_id=event.noun_instance_id,
-            action_instance_id=event.action_instance_id,
-            time_position=event.time_position,
-            pair_index=pair_index,
-            event_index=event.event_index,
-            noun_text=noun_text,
-            action_text=action_text,
-            role=role,
-            pair_kind=pair_kind,
-            polarity=event.polarity,
-            info_pair={
-                "pair_kind": pair_kind,
-                "noun_instance_id": event.noun_instance_id,
-                "action_instance_id": event.action_instance_id,
-                "noun_type": event.noun_type,
-                "action_type": event.action_type,
-                "time_position": event.time_position,
-                "source_action_type": event.source_action_type,
-                "source_time_position": event.source_time_position,
-                "source_pair_index": event.source_pair_index,
-                "source_event_index": event.source_event_index,
-                "event_index": event.event_index,
-                "role": role,
-                "polarity": event.polarity,
-            },
-        )
-        return event
+        new_embedding = self.transform_instance_embedding(old_embedding, action_type).detach()
+        short_memory.store_noun_instance(noun_instance_id, new_embedding, noun_text=noun_text)
 
-    def training_step_next_event(
-        self,
-        short_memory,
-        action_type: int,
-        target_action_embedding=None,
-        target_action_type=None,
-        optimizer=None,
-        steps=None,
-        epochs: int = 10,
-    ):
-        optimizer = optimizer or self.build_optimizer()
-        epochs = max(1, int(epochs))
-
-        target_embedding = None
-        last_prediction = None
-        last_pred_action = None
-        last_pred_action_type = None
-        last_loss = None
-        loss_history = []
-
-        for _ in range(epochs):
-            prediction = self.predict_from_short_memory(
-                short_memory, action_type, steps=steps
-            )
-            pred_action = prediction["pred_action"]
-            pred_action_type = prediction["pred_action_type"]
-
-            if target_action_embedding is None:
-                if target_action_type is None:
-                    raise ValueError("Provide target_action_embedding or target_action_type")
-                current_target_embedding = self.get_action_embedding(target_action_type)
-            else:
-                current_target_embedding = target_action_embedding.to(
-                    pred_action.device, dtype=pred_action.dtype
-                )
-
-            current_target_embedding = current_target_embedding.view(-1)
-            loss = F.mse_loss(pred_action, current_target_embedding)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            with torch.no_grad():
-                self.action_embeddings.weight[0].zero_()
-
-            target_embedding = current_target_embedding.detach().clone()
-            last_prediction = prediction
-            last_pred_action = pred_action.detach()
-            last_pred_action_type = int(pred_action_type)
-            last_loss = float(loss.item())
-            loss_history.append(last_loss)
-
-        return {
-            "loss": float(last_loss),
-            "loss_history": loss_history,
-            "epochs": epochs,
-            "target_action_type": None if target_action_type is None else int(target_action_type),
-            "pred_action": last_pred_action,
-            "pred_action_type": last_pred_action_type,
-            "target_action_embedding": target_embedding,
-            "focus_noun_embedding": last_prediction["focus_noun_embedding"],
-            "focus_noun_type": last_prediction["focus_noun_type"],
-            "focus_action_type": last_prediction["focus_action_type"],
-            "focus_time_position": last_prediction["focus_time_position"],
-            "focus_pair_index": last_prediction["focus_pair_index"],
-            "focus_noun_instance_id": last_prediction["focus_noun_instance_id"],
-            "focus_action_instance_id": last_prediction["focus_action_instance_id"],
-        }
-
-    def training_step_from_short_memory(
-        self,
-        short_memory,
-        action_type: int,
-        target_action_embedding=None,
-        target_action_type=None,
-        optimizer=None,
-        steps=None,
-        epochs: int = 10,
-    ):
-        return self.training_step_next_event(
-            short_memory=short_memory,
-            action_type=action_type,
-            target_action_embedding=target_action_embedding,
-            target_action_type=target_action_type,
-            optimizer=optimizer,
-            steps=steps,
-            epochs=epochs,
-        )
-
-    def autoregressive_step(
-        self,
-        short_memory,
-        noun_embedding: torch.Tensor = None,
-        action_type: int = None,
-        score=0.0,
-        noun_type=None,
-        noun_instance_id=None,
-        time_position: int = 0,
-        steps=None,
-    ):
-        if action_type is None:
-            raise ValueError("action_type must be provided")
-
-        prediction = self.predict_next_event(short_memory, action_type, steps=steps, score=score)
-        pred_action = prediction["pred_action"]
-        pred_action_type = prediction["pred_action_type"]
-        focus_noun_embedding = prediction["focus_noun_embedding"]
-        predicted_event = prediction["predicted_event"]
-
-        if noun_embedding is not None:
-            predicted_event.noun_embedding = noun_embedding.detach().clone()
-        if noun_type is not None:
-            predicted_event.noun_type = noun_type
-        if noun_instance_id is not None:
-            predicted_event.noun_instance_id = noun_instance_id
-        if time_position != 0:
-            predicted_event.time_position = int(time_position)
-
-        stored_event = self.append_predicted_event(short_memory, predicted_event)
-        return {
-            "pred_action": pred_action.detach(),
-            "pred_action_type": int(pred_action_type),
-            "stored_action_embedding": stored_event.action_embedding.detach(),
-            "focus_noun_embedding": None if focus_noun_embedding is None else focus_noun_embedding.detach().clone(),
-            "focus_noun_type": prediction["focus_noun_type"],
-            "focus_action_type": prediction["focus_action_type"],
-            "focus_time_position": prediction["focus_time_position"],
-            "focus_pair_index": prediction["focus_pair_index"],
-            "focus_noun_instance_id": prediction["focus_noun_instance_id"],
-            "focus_action_instance_id": prediction["focus_action_instance_id"],
-            "used_noun_embedding": None if stored_event.noun_embedding is None else stored_event.noun_embedding.detach().clone(),
-            "used_noun_type": stored_event.noun_type,
-            "used_noun_instance_id": stored_event.noun_instance_id,
-            "predicted_event": stored_event,
-            "predicted_event_dict": stored_event.as_dict(),
-        }
-
-    def autoregressive_rollout(
-        self,
-        short_memory,
-        noun_embeddings,
-        initial_action_type: int,
-        score=0.0,
-        noun_types=None,
-        time_positions=None,
-        steps=None,
-    ):
-        outputs = []
-        current_action_type = int(initial_action_type)
-        noun_types = noun_types or [None] * len(noun_embeddings)
-        time_positions = time_positions or list(range(len(noun_embeddings)))
-
-        for noun_embedding, noun_type, time_position in zip(
-            noun_embeddings, noun_types, time_positions
-        ):
-            result = self.autoregressive_step(
-                short_memory=short_memory,
-                noun_embedding=noun_embedding,
-                action_type=current_action_type,
+        stored_action_instance_id = action_instance_id
+        if append_event:
+            if time_position is None:
+                focus_entry = short_memory.get_focus_entry()
+                if focus_entry is None or focus_entry.time_position is None:
+                    time_position = len(short_memory.event_entries)
+                else:
+                    time_position = int(focus_entry.time_position) + 1
+            if event_index is None:
+                event_index = short_memory.next_event_index()
+            action_embedding = self.get_action_embedding(action_type).detach().clone()
+            short_memory.append_event(
+                noun_embedding=new_embedding,
+                action_embedding=action_embedding,
                 score=score,
                 noun_type=noun_type,
-                time_position=time_position,
-                steps=steps,
+                action_type=action_type,
+                time_position=int(time_position),
+                pair_index=pair_index,
+                event_index=event_index,
+                noun_text=noun_text,
+                action_text=action_text,
+                noun_instance_id=noun_instance_id,
+                action_instance_id=action_instance_id,
             )
-            outputs.append(result)
-            current_action_type = result["pred_action_type"]
+            focus_entry = short_memory.get_focus_entry()
+            stored_action_instance_id = None if focus_entry is None else focus_entry.action_instance_id
 
-        return outputs
+        return InstanceUpdateResult(
+            noun_instance_id=noun_instance_id,
+            noun_type=noun_type,
+            action_type=int(action_type),
+            action_instance_id=stored_action_instance_id,
+            old_embedding=old_embedding.detach().clone(),
+            new_embedding=new_embedding.detach().clone(),
+            time_position=time_position,
+            event_index=event_index,
+            pair_index=pair_index,
+            score=float(score),
+        )
 
-    def train_action_model(
+    def update_focus_instance_embedding(
         self,
-        input_data: torch.Tensor,
-        target_action: torch.Tensor,
+        short_memory,
         action_type: int,
-        optimizer=None,
-        steps: int = 100,
-    ):
-        optimizer = optimizer or self.build_optimizer()
-        device = next(self.parameters()).device
-        input_data = input_data.to(device)
-        target_action = target_action.to(device).view(-1)
+        *,
+        steps=None,
+        score: float = 0.5,
+        action_text: Optional[str] = None,
+        append_event: bool = True,
+    ) -> InstanceUpdateResult:
+        focus_entry = short_memory.get_focus_entry(steps=steps)
+        if focus_entry is None or focus_entry.noun_instance_id is None:
+            raise ValueError("short_memory has no focus noun instance to update")
+        return self.update_instance_embedding(
+            short_memory,
+            focus_entry.noun_instance_id,
+            action_type,
+            noun_type=focus_entry.noun_type,
+            noun_text=focus_entry.noun_text,
+            action_text=action_text,
+            score=score,
+            append_event=append_event,
+        )
 
-        last_loss = None
-        for _ in range(steps):
-            optimizer.zero_grad()
-            action_pred = self.forward(input_data, action_type)
-            last_loss = F.mse_loss(action_pred, target_action)
-            last_loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                self.action_embeddings.weight[0].zero_()
-        return float(last_loss.item()) if last_loss is not None else 0.0
+    def update_space_state(
+        self,
+        short_memory,
+        source_instance_id: str,
+        target_instance_id: str,
+        action_space_type: int,
+        *,
+        relation: Optional[str] = None,
+        noun_type: Optional[int] = None,
+        noun_text: Optional[str] = None,
+        action_text: Optional[str] = None,
+        score: float = 0.5,
+        time_position: Optional[int] = None,
+        pair_index: Optional[int] = None,
+        event_index: Optional[int] = None,
+        replace_family: bool = True,
+        append_event: bool = True,
+    ) -> SpaceUpdateResult:
+        source_embedding = short_memory.get_noun_embedding(source_instance_id)
+        if source_embedding is None:
+            raise ValueError(f"source instance `{source_instance_id}` is not stored in short_memory")
 
-    def forward_with_sequence_build(self, input_2d: torch.Tensor, action_type: int, steps: int = 1) -> dict:
-        current_seq = input_2d.clone()
-        predictions = []
-        action_types = []
-        current_action_type = int(action_type)
+        if noun_type is None:
+            focus_entry = short_memory.get_focus_entry()
+            if focus_entry is not None and focus_entry.noun_instance_id == source_instance_id:
+                noun_type = focus_entry.noun_type
 
-        for step in range(steps):
-            pred_action = self.forward(current_seq, current_action_type)
-            predictions.append(pred_action.detach().cpu())
-            action_types.append(current_action_type)
+        if noun_text is None:
+            metadata = short_memory.get_noun_instance_metadata(source_instance_id)
+            if metadata is not None:
+                noun_text = metadata.get("noun_text")
 
-            last_col = current_seq[:, -1]
-            noun_last = last_col[: self.noun_dim]
-            next_action_type = self.nearest_action_type(pred_action)
-            next_action_embedding = self.get_action_embedding(next_action_type).detach().to(pred_action.device)
-            new_col = torch.cat([noun_last, next_action_embedding], dim=0).unsqueeze(1)
-            current_seq = torch.cat([current_seq, new_col], dim=1)
-            current_action_type = next_action_type
+        resolved_relation = self.resolve_action_space_relation(action_space_type, relation=relation)
+        if time_position is None:
+            focus_entry = short_memory.get_focus_entry()
+            if focus_entry is None or focus_entry.time_position is None:
+                time_position = len(short_memory.event_entries)
+            else:
+                time_position = int(focus_entry.time_position) + 1
+        if event_index is None:
+            event_index = short_memory.next_event_index()
 
-        return {
-            "final_sequence": current_seq,
-            "predictions": predictions,
-            "action_types": action_types,
-        }
+        short_memory.append_spatial_fact(
+            source_instance_id=source_instance_id,
+            relation=resolved_relation,
+            target_instance_id=target_instance_id,
+            time_position=int(time_position),
+            replace_family=replace_family,
+        )
+
+        if append_event:
+            space_action_embedding = self.get_action_space_embedding(action_space_type).detach().clone()
+            effective_action_text = action_text or self.get_action_space_name(action_space_type)
+            short_memory.append_event(
+                noun_embedding=source_embedding.detach().clone(),
+                action_embedding=space_action_embedding,
+                score=score,
+                noun_type=noun_type,
+                action_type=None,
+                time_position=int(time_position),
+                pair_index=pair_index,
+                event_index=event_index,
+                noun_text=noun_text,
+                action_text=effective_action_text,
+                noun_instance_id=source_instance_id,
+                action_instance_id=None,
+                pair_kind="noun_space_action",
+                info_pair={
+                    "event_channel": "space",
+                    "action_space_type": int(action_space_type),
+                    "action_space_name": self.get_action_space_name(action_space_type),
+                    "space_relation": resolved_relation,
+                    "space_target_instance_id": target_instance_id,
+                },
+            )
+
+        return SpaceUpdateResult(
+            source_instance_id=source_instance_id,
+            target_instance_id=target_instance_id,
+            action_space_type=int(action_space_type),
+            action_space_name=self.get_action_space_name(action_space_type),
+            relation=resolved_relation,
+            time_position=time_position,
+            event_index=event_index,
+            pair_index=pair_index,
+            score=float(score),
+            replace_family=bool(replace_family),
+        )
+
+    def update_focus_space_state(
+        self,
+        short_memory,
+        target_instance_id: str,
+        action_space_type: int,
+        *,
+        relation: Optional[str] = None,
+        steps=None,
+        score: float = 0.5,
+        action_text: Optional[str] = None,
+        replace_family: bool = True,
+        append_event: bool = True,
+    ) -> SpaceUpdateResult:
+        focus_entry = short_memory.get_focus_entry(steps=steps)
+        if focus_entry is None or focus_entry.noun_instance_id is None:
+            raise ValueError("short_memory has no focus noun instance to update in space_state")
+        return self.update_space_state(
+            short_memory,
+            focus_entry.noun_instance_id,
+            target_instance_id,
+            action_space_type,
+            relation=relation,
+            noun_type=focus_entry.noun_type,
+            noun_text=focus_entry.noun_text,
+            action_text=action_text,
+            score=score,
+            replace_family=replace_family,
+            append_event=append_event,
+        )
+
+    def encode_sequence_context(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.encode_sequence_context"))
+
+    def predict_action_from_context(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.predict_action_from_context"))
+
+    def predict_from_short_memory(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.predict_from_short_memory"))
+
+    def predict_next_event(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.predict_next_event"))
+
+    def append_predicted_event(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.append_predicted_event"))
+
+    def training_step_next_event(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.training_step_next_event"))
+
+    def training_step_from_short_memory(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.training_step_from_short_memory"))
+
+    def autoregressive_step(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.autoregressive_step"))
+
+    def autoregressive_rollout(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.autoregressive_rollout"))
+
+    def train_action_model(self, *args, **kwargs):
+        raise WorldModelResetError(_reset_message("WorldModel.train_action_model"))
 
 
 Action_list = get_full_action_type_list()
 
 
-def train_action_model(world_model, input_data, target_action, action_index, optimizer=None, steps=100):
-    return world_model.train_action_model(
-        input_data=input_data,
-        target_action=target_action,
-        action_type=action_index,
-        optimizer=optimizer,
-        steps=steps,
-    )
+def train_action_model(*args, **kwargs):
+    raise WorldModelResetError(_reset_message("train_action_model"))

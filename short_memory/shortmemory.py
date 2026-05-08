@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 
 from prototype.instance_metadata import default_entity_kind, default_gender, normalize_instance_scope
+from short_memory.space_state import SpaceState, SpatialFact, SpatialPatch
 
 import torch
 import torch.nn.functional as F
@@ -127,6 +128,7 @@ class ShortMemory:
         self.relation_entries: List[RelationMemoryEntry] = []
         self.reward_entries: List[RewardMemoryEntry] = []
         self.surprise_entries: List[SurpriseMemoryEntry] = []
+        self.space_state = SpaceState()
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_instance_metadata: Dict[str, Dict[str, Any]] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
@@ -171,6 +173,9 @@ class ShortMemory:
 
     def surprise_list(self) -> List[SurpriseMemoryEntry]:
         return list(self.surprise_entries)
+
+    def space_fact_list(self) -> List[SpatialFact]:
+        return list(self.space_state.facts)
 
     def _resolve_state_dim(self, noun_embedding: torch.Tensor, action_embedding: torch.Tensor) -> int:
         candidate_dim = noun_embedding.view(-1).numel() + action_embedding.view(-1).numel()
@@ -268,6 +273,7 @@ class ShortMemory:
         referenced_nouns.update(
             entry.object_instance_id for entry in self.surprise_entries if entry.object_instance_id is not None
         )
+        referenced_nouns.update(self.space_state.referenced_instance_ids())
         referenced_actions = {
             entry.action_instance_id for entry in self.event_entries if entry.action_instance_id is not None
         }
@@ -781,6 +787,8 @@ class ShortMemory:
             info_pair=base_info_pair,
         )
         self.event_entries.append(entry)
+        if event_index is not None:
+            self._event_counter = max(self._event_counter, int(event_index) + 1)
         self._insert_counter += 1
         self._sort_event_entries()
         self._trim()
@@ -1321,6 +1329,52 @@ class ShortMemory:
     def get_relation_pairs(self):
         return [dict(entry.info_pair) for entry in self.relation_entries]
 
+    def append_spatial_fact(
+        self,
+        source_instance_id: str,
+        relation: str,
+        target_instance_id: str,
+        time_position: Optional[int] = None,
+        confidence: float = 1.0,
+        replace_family: bool = False,
+    ) -> SpatialFact:
+        fact = SpatialFact(
+            source_instance_id=source_instance_id,
+            relation=relation,
+            target_instance_id=target_instance_id,
+            time_position=time_position,
+            confidence=float(confidence),
+        )
+        self.space_state.add_fact(fact, replace_family=replace_family)
+        self._prune_instance_stores()
+        return fact
+
+    def remove_spatial_fact(
+        self,
+        source_instance_id: str,
+        relation: str,
+        target_instance_id: str,
+        time_position: Optional[int] = None,
+        confidence: float = 1.0,
+    ) -> SpatialFact:
+        fact = SpatialFact(
+            source_instance_id=source_instance_id,
+            relation=relation,
+            target_instance_id=target_instance_id,
+            time_position=time_position,
+            confidence=float(confidence),
+        )
+        self.space_state.remove_fact(fact)
+        self._prune_instance_stores()
+        return fact
+
+    def apply_spatial_patch(self, patch: SpatialPatch, replace_families: bool = False) -> None:
+        self.space_state.apply_patch(patch, replace_families=replace_families)
+        self._prune_instance_stores()
+
+    def get_spatial_summary(self, focus_instance_id: str) -> Dict[str, Any]:
+        return self.space_state.build_summary(focus_instance_id)
+
     def get_event_content_view(self, order_by: str = "time"):
         if order_by == "time":
             entries = self.event_entries
@@ -1446,12 +1500,16 @@ class ShortMemory:
             for entry in entries
         ]
 
+    def get_space_content_view(self):
+        return self.space_state.content_view()
+
     def get_content_view(self, order_by: str = "time"):
         return {
             "event": self.get_event_content_view(order_by=order_by),
             "relation": self.get_relation_content_view(order_by=order_by),
             "reward": self.get_reward_content_view(order_by=order_by),
             "surprise": self.get_surprise_content_view(order_by=order_by),
+            "space": self.get_space_content_view(),
         }
 
     def latest_state(self):
@@ -1482,6 +1540,7 @@ class ShortMemory:
         self.relation_entries.clear()
         self.reward_entries.clear()
         self.surprise_entries.clear()
+        self.space_state.clear()
         self.noun_instance_memory.clear()
         self.noun_instance_metadata.clear()
         self.action_instance_memory.clear()

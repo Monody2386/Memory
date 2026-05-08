@@ -7,6 +7,13 @@ import torch
 from short_memory import ScoredTensorQueue
 
 
+RESET_TRAINING_MESSAGE = (
+    "Legacy world-model training has been disabled because the old world-model "
+    "logic was intentionally cleared. Implement the new world_state/event_state "
+    "pipeline before re-enabling training."
+)
+
+
 def _wm():
     return importlib.import_module("world.world_model")
 
@@ -90,6 +97,7 @@ def train_world_model(
     num_epochs: int = 1,
     device: str = "cpu",
 ):
+    raise RuntimeError(RESET_TRAINING_MESSAGE)
     os.makedirs(save_dir, exist_ok=True)
     _, world_model = _create_world_model(device)
     _load_weights_if_available(world_model, load_dir, device)
@@ -124,6 +132,7 @@ def train_world_model_with_validation(
     device: str = "cpu",
     patience: int = 5,
 ) -> dict:
+    raise RuntimeError(RESET_TRAINING_MESSAGE)
     os.makedirs(save_dir, exist_ok=True)
     _, world_model = _create_world_model(device)
     _load_weights_if_available(world_model, load_dir, device)

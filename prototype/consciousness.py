@@ -117,12 +117,10 @@ class Consciousness:
                 old_type = old_action_to_type.get(action_name)
                 if old_type is None:
                     continue
-                new_model.action_models[new_type - 1].load_state_dict(
-                    old_model.action_models[old_type - 1].state_dict()
-                )
-                new_model.action_embeddings.weight[new_type].copy_(
-                    old_model.action_embeddings.weight[old_type]
-                )
+                if old_type < old_model.action_embeddings.weight.shape[0]:
+                    new_model.action_embeddings.weight[new_type].copy_(
+                        old_model.action_embeddings.weight[old_type]
+                    )
             new_model.action_embeddings.weight[0].zero_()
 
         self.world_model = new_model
