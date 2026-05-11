@@ -8,10 +8,12 @@ from .shortmemory import (
     SurpriseMemoryEntry,
     short_memory,
 )
+from .instance import MemoryInstance
 from .space_state import SpaceState, SpatialFact, SpatialPatch
 
 __all__ = [
     "EventMemoryEntry",
+    "MemoryInstance",
     "MemoryEntry",
     "RelationMemoryEntry",
     "RewardMemoryEntry",

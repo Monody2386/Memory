@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 
 from prototype.instance_metadata import default_entity_kind, default_gender, normalize_instance_scope
+from short_memory.instance import MemoryInstance
 from short_memory.space_state import SpaceState, SpatialFact, SpatialPatch
 
 import torch
@@ -129,6 +130,7 @@ class ShortMemory:
         self.reward_entries: List[RewardMemoryEntry] = []
         self.surprise_entries: List[SurpriseMemoryEntry] = []
         self.space_state = SpaceState()
+        self.instances: Dict[str, MemoryInstance] = {}
         self.noun_instance_memory: Dict[str, torch.Tensor] = {}
         self.noun_instance_metadata: Dict[str, Dict[str, Any]] = {}
         self.action_instance_memory: Dict[str, torch.Tensor] = {}
@@ -283,6 +285,18 @@ class ShortMemory:
         self.noun_instance_metadata = {
             key: value for key, value in self.noun_instance_metadata.items() if key in referenced_nouns
         }
+        self.instances = {
+            key: value for key, value in self.instances.items() if key in referenced_nouns
+        }
+        active_event_ids = {id(entry) for entry in self.event_entries}
+        active_relation_ids = {id(entry) for entry in self.relation_entries}
+        active_reward_ids = {id(entry) for entry in self.reward_entries}
+        active_surprise_ids = {id(entry) for entry in self.surprise_entries}
+        for instance in self.instances.values():
+            instance.events = [entry for entry in instance.events if id(entry) in active_event_ids]
+            instance.relations = [entry for entry in instance.relations if id(entry) in active_relation_ids]
+            instance.rewards = [entry for entry in instance.rewards if id(entry) in active_reward_ids]
+            instance.surprises = [entry for entry in instance.surprises if id(entry) in active_surprise_ids]
         self.action_instance_memory = {
             key: value for key, value in self.action_instance_memory.items() if key in referenced_actions
         }
@@ -314,7 +328,90 @@ class ShortMemory:
         instance_scope: Optional[str] = None,
     ) -> None:
         self.noun_instance_memory[instance_id] = noun_embedding.to(self.device).view(-1).detach().clone()
-        self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
+        metadata = self.ensure_noun_instance_metadata(instance_id, noun_text=noun_text, instance_scope=instance_scope)
+        self.ensure_instance(
+            instance_id,
+            noun_text=noun_text,
+            embedding=self.noun_instance_memory[instance_id],
+            metadata=metadata,
+        )
+
+    def ensure_instance(
+        self,
+        instance_id: str,
+        *,
+        noun_text: Optional[str] = None,
+        noun_type: Optional[int] = None,
+        embedding: Optional[torch.Tensor] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        owner_instance_id: Optional[str] = None,
+        owner_role: Optional[str] = None,
+        entity_kind: Optional[str] = None,
+        gender: Optional[str] = None,
+        instance_scope: Optional[str] = None,
+        time_position: int = 0,
+    ) -> MemoryInstance:
+        instance = self.instances.get(instance_id)
+        if instance is None:
+            instance = MemoryInstance(
+                instance_id=instance_id,
+                noun_text=None if noun_text is None else noun_text.lower(),
+                noun_type=None if noun_type is None else int(noun_type),
+                owner_instance_id=owner_instance_id,
+                owner_role=owner_role,
+                entity_kind="unknown" if entity_kind is None else str(entity_kind),
+                gender="unknown" if gender is None else str(gender),
+                instance_scope="scene" if instance_scope is None else normalize_instance_scope(instance_scope),
+                created_at=int(time_position),
+                last_seen_at=int(time_position),
+            )
+            self.instances[instance_id] = instance
+
+        if noun_text is not None:
+            instance.noun_text = noun_text.lower()
+        if noun_type is not None:
+            instance.noun_type = int(noun_type)
+        if embedding is not None:
+            instance.update_embedding(embedding.to(self.device).view(-1))
+        if metadata is not None:
+            instance.set_metadata(metadata)
+        instance.update_metadata(
+            owner_instance_id=owner_instance_id,
+            owner_role=owner_role,
+            entity_kind=entity_kind,
+            gender=gender,
+            instance_scope=None if instance_scope is None else normalize_instance_scope(instance_scope),
+        )
+        instance.last_seen_at = max(instance.last_seen_at, int(time_position))
+        return instance
+
+    def get_instance(self, instance_id: Optional[str]) -> Optional[MemoryInstance]:
+        if instance_id is None:
+            return None
+        return self.instances.get(instance_id)
+
+    def get_instance_content_view(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        instance = self.get_instance(instance_id)
+        if instance is None:
+            return None
+        return {
+            **instance.summary(),
+            "events": [self._instance_entry_view(entry) for entry in instance.events],
+            "relations": [self._instance_entry_view(entry) for entry in instance.relations],
+            "rewards": [self._instance_entry_view(entry) for entry in instance.rewards],
+            "surprises": [self._instance_entry_view(entry) for entry in instance.surprises],
+        }
+
+    def get_instances_view(self) -> List[Dict[str, Any]]:
+        return [instance.summary() for instance in self.instances.values()]
+
+    def _instance_entry_view(self, entry) -> Dict[str, Any]:
+        info_pair = getattr(entry, "info_pair", None)
+        if info_pair:
+            return dict(info_pair)
+        if hasattr(entry, "__dict__"):
+            return dict(entry.__dict__)
+        return {"value": entry}
 
     def _default_instance_metadata(self, noun_text: Optional[str], instance_scope: Optional[str] = None) -> Dict[str, Any]:
         noun_key = None if noun_text is None else noun_text.lower()
@@ -344,6 +441,11 @@ class ShortMemory:
             if instance_scope is not None and not existing.get("instance_scope"):
                 existing["instance_scope"] = normalize_instance_scope(instance_scope)
             self.noun_instance_metadata[instance_id] = dict(existing)
+        instance = self.instances.get(instance_id)
+        if instance is not None:
+            if noun_text is not None:
+                instance.noun_text = noun_text.lower()
+            instance.set_metadata(self.noun_instance_metadata[instance_id])
         return dict(self.noun_instance_metadata[instance_id])
 
     def get_noun_instance_metadata(self, instance_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -386,6 +488,16 @@ class ShortMemory:
                 polarity_map[str(key)] = int(polarity)
             metadata["attribute_polarity"] = polarity_map
         self.noun_instance_metadata[instance_id] = dict(metadata)
+        self.ensure_instance(
+            instance_id,
+            noun_text=metadata.get("noun_text"),
+            metadata=metadata,
+            owner_instance_id=metadata.get("owner_instance_id"),
+            owner_role=metadata.get("owner_role"),
+            entity_kind=metadata.get("entity_kind"),
+            gender=metadata.get("gender"),
+            instance_scope=metadata.get("instance_scope"),
+        )
         return dict(metadata)
 
     def store_action_instance(self, instance_id: str, action_embedding: torch.Tensor) -> None:
@@ -787,6 +899,14 @@ class ShortMemory:
             info_pair=base_info_pair,
         )
         self.event_entries.append(entry)
+        self.ensure_instance(
+            noun_instance_id,
+            noun_text=noun_text,
+            noun_type=noun_type,
+            embedding=noun_embedding,
+            metadata=self.get_noun_instance_metadata(noun_instance_id),
+            time_position=int(time_position),
+        ).add_event(entry)
         if event_index is not None:
             self._event_counter = max(self._event_counter, int(event_index) + 1)
         self._insert_counter += 1
@@ -878,6 +998,22 @@ class ShortMemory:
             info_pair=base_info_pair,
         )
         self.relation_entries.append(entry)
+        if source_instance_id is not None:
+            self.ensure_instance(
+                source_instance_id,
+                noun_text=source_text,
+                noun_type=source_type,
+                metadata=self.get_noun_instance_metadata(source_instance_id),
+                time_position=int(time_position),
+            ).add_relation(entry)
+        if target_instance_id is not None:
+            self.ensure_instance(
+                target_instance_id,
+                noun_text=target_text,
+                noun_type=target_type,
+                metadata=self.get_noun_instance_metadata(target_instance_id),
+                time_position=int(time_position),
+            ).add_relation(entry)
         self._insert_counter += 1
         self._sort_relation_entries()
         self.ensure_relation_clone(relation_kind, relation_name)
@@ -955,6 +1091,19 @@ class ShortMemory:
             info_pair=base_info_pair,
         )
         self.reward_entries.append(entry)
+        self.ensure_instance(
+            subject_instance_id,
+            noun_text=subject_text,
+            metadata=self.get_noun_instance_metadata(subject_instance_id),
+            time_position=int(time_position),
+        ).add_reward(entry)
+        if object_instance_id is not None:
+            self.ensure_instance(
+                object_instance_id,
+                noun_text=object_text,
+                metadata=self.get_noun_instance_metadata(object_instance_id),
+                time_position=int(time_position),
+            ).add_reward(entry)
         self.reward_entries.sort(key=lambda item: (item.time_position, item.pair_index))
         self._trim()
         return dict(entry.info_pair)
@@ -1021,6 +1170,19 @@ class ShortMemory:
             info_pair=base_info_pair,
         )
         self.surprise_entries.append(entry)
+        self.ensure_instance(
+            subject_instance_id,
+            noun_text=subject_text,
+            metadata=self.get_noun_instance_metadata(subject_instance_id),
+            time_position=int(time_position),
+        ).add_surprise(entry)
+        if object_instance_id is not None:
+            self.ensure_instance(
+                object_instance_id,
+                noun_text=object_text,
+                metadata=self.get_noun_instance_metadata(object_instance_id),
+                time_position=int(time_position),
+            ).add_surprise(entry)
         self.surprise_entries.sort(key=lambda item: (item.time_position, item.pair_index))
         self._trim()
         return dict(entry.info_pair)
@@ -1242,6 +1404,10 @@ class ShortMemory:
             if entry.source_instance_id == instance_id or entry.target_instance_id == instance_id:
                 entry.score = max(float(entry.score), float(target_score))
                 relation_count += 1
+
+        instance = self.get_instance(instance_id)
+        if instance is not None:
+            instance.set_score_floor(target_score)
 
         self._reorder_event_entries_for_world_model()
         self._sort_relation_entries()
@@ -1510,6 +1676,7 @@ class ShortMemory:
             "reward": self.get_reward_content_view(order_by=order_by),
             "surprise": self.get_surprise_content_view(order_by=order_by),
             "space": self.get_space_content_view(),
+            "instance": self.get_instances_view(),
         }
 
     def latest_state(self):
@@ -1541,6 +1708,7 @@ class ShortMemory:
         self.reward_entries.clear()
         self.surprise_entries.clear()
         self.space_state.clear()
+        self.instances.clear()
         self.noun_instance_memory.clear()
         self.noun_instance_metadata.clear()
         self.action_instance_memory.clear()

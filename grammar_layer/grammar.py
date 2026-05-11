@@ -602,6 +602,14 @@ def build_instance_context_from_memory(short_memory) -> Dict[str, object]:
             continue
         register(noun_text, instance_id, -1, -1, 0.0)
 
+    for instance_id, instance in getattr(short_memory, "instances", {}).items():
+        if instance_id in context["by_instance"]:
+            continue
+        noun_text = getattr(instance, "noun_text", None)
+        if noun_text is None:
+            continue
+        register(noun_text, instance_id, getattr(instance, "last_seen_at", -1), -1, getattr(instance, "score", 0.0))
+
     for noun_key, bucket in context["by_noun"].items():
         bucket.sort(key=lambda item: (item[0], item[1]))
         context["by_noun"][noun_key] = [instance_id for _, _, instance_id in bucket]
@@ -1238,18 +1246,63 @@ def _bind_existing_noun_instances(
     )
     bound_tokens = list(tokens)
     bound_tags: List[TaggedToken] = []
+    sentence_assignments: Dict[str, str] = {}
+    create_counters: Dict[str, int] = {}
 
     for token, tag in zip(tokens, tagged_tokens):
         if tag.pos != "noun":
             bound_tags.append(tag)
             continue
 
+        noun_key = _token_entity_text(token, tag)
         noun_instance_id = tag.instance_id
         if noun_instance_id is None:
-            noun_key = _token_entity_text(token, tag)
-            noun_instance_id = _resolve_existing_instance_id(noun_key, resolved_context, {})
-            if noun_instance_id is None and is_named_person_noun(noun_key):
-                noun_instance_id = _build_instance_id(noun_key, {}, instance_context=resolved_context)
+            noun_instance_id = _resolve_existing_instance_id(
+                noun_key,
+                resolved_context,
+                sentence_assignments,
+            )
+            if noun_instance_id is None:
+                noun_instance_id = _build_instance_id(
+                    noun_key,
+                    create_counters,
+                    instance_context=resolved_context,
+                )
+        sentence_assignments[noun_key.lower()] = noun_instance_id
+
+        noun_type = None
+        if short_memory is not None and hasattr(short_memory, "ensure_noun_instance"):
+            noun_type, _, noun_instance_id = short_memory.ensure_noun_instance(
+                noun_key,
+                noun_instance_id,
+            )
+            sentence_assignments[noun_key.lower()] = noun_instance_id
+
+        if short_memory is not None and hasattr(short_memory, "update_noun_instance_metadata"):
+            short_memory.update_noun_instance_metadata(
+                noun_instance_id,
+                noun_text=noun_key,
+                owner_instance_id=tag.owner_instance_id,
+                owner_role=tag.owner_role,
+            )
+            if hasattr(short_memory, "ensure_instance"):
+                short_memory.ensure_instance(
+                    noun_instance_id,
+                    noun_text=noun_key,
+                    noun_type=noun_type,
+                    owner_instance_id=tag.owner_instance_id,
+                    owner_role=tag.owner_role,
+                    metadata=short_memory.get_noun_instance_metadata(noun_instance_id),
+                )
+        elif short_memory is not None and hasattr(short_memory, "ensure_instance"):
+            short_memory.ensure_instance(
+                noun_instance_id,
+                noun_text=noun_key,
+                noun_type=noun_type,
+                owner_instance_id=tag.owner_instance_id,
+                owner_role=tag.owner_role,
+            )
+
         bound_surface = noun_instance_id if noun_instance_id is not None else tag.text
         bound_tokens[len(bound_tags)] = bound_surface
         bound_tags.append(
@@ -1260,13 +1313,96 @@ def _bind_existing_noun_instances(
                 source=tag.source,
                 question_prompt=tag.question_prompt,
                 instance_id=noun_instance_id,
-                entity_text=tag.entity_text or token,
+                entity_text=noun_key,
                 owner_instance_id=tag.owner_instance_id,
                 owner_role=tag.owner_role,
             )
         )
 
     return bound_tokens, bound_tags
+
+
+def _apply_reduced_relations_to_instances(
+    relation_tuples: Sequence[RelationTuple],
+    tagged_tokens: Sequence[TaggedToken],
+    *,
+    short_memory=None,
+) -> List[RelationTuple]:
+    if not relation_tuples:
+        return list(relation_tuples)
+
+    noun_instance_ids = {
+        _token_entity_text(tag.text, tag).lower(): tag.instance_id
+        for tag in tagged_tokens
+        if tag.pos == "noun" and tag.instance_id is not None
+    }
+    updated_relations: List[RelationTuple] = []
+
+    for relation_tuple in relation_tuples:
+        source_instance_id = relation_tuple.source_instance_id
+        if source_instance_id is None:
+            source_instance_id = noun_instance_ids.get(relation_tuple.source.lower())
+
+        updated = RelationTuple(
+            source=relation_tuple.source,
+            relation=relation_tuple.relation,
+            target=relation_tuple.target,
+            kind=relation_tuple.kind,
+            source_instance_id=source_instance_id,
+            target_instance_id=relation_tuple.target_instance_id,
+            owner_instance_id=relation_tuple.owner_instance_id,
+            owner_role=relation_tuple.owner_role,
+            source_tokens=list(relation_tuple.source_tokens),
+            polarity=relation_tuple.polarity,
+            accept_label=relation_tuple.accept_label,
+            question_label=relation_tuple.question_label,
+        )
+        updated_relations.append(updated)
+
+        if (
+            short_memory is None
+            or source_instance_id is None
+            or updated.kind != "adj_noun_relation"
+            or not hasattr(short_memory, "get_instance")
+        ):
+            continue
+
+        instance = short_memory.get_instance(source_instance_id)
+        if instance is None:
+            continue
+        instance.add_relation(updated)
+
+        try:
+            _, arm, _ = _load_language_context()
+            if updated.relation not in arm.adj_relation_list:
+                continue
+            relation_type = arm.adj_relation_list.index(updated.relation) + 1
+            noun_idx, adjusted_embedding = inject_adjective_into_noun_embedding(
+                updated.source,
+                updated.target,
+                relation_type=relation_type,
+            )
+        except ValueError:
+            continue
+
+        if hasattr(short_memory, "store_noun_instance"):
+            short_memory.store_noun_instance(
+                source_instance_id,
+                adjusted_embedding,
+                noun_text=updated.source,
+            )
+        if hasattr(short_memory, "ensure_instance"):
+            short_memory.ensure_instance(
+                source_instance_id,
+                noun_text=updated.source,
+                noun_type=noun_idx,
+                embedding=adjusted_embedding,
+                metadata=short_memory.get_noun_instance_metadata(source_instance_id)
+                if hasattr(short_memory, "get_noun_instance_metadata")
+                else None,
+            )
+
+    return updated_relations
 
 
 # ===========================================================================
@@ -2412,6 +2548,11 @@ def parse_sentence(
         reduced_tokens,
         reduced_tags,
         instance_context=instance_context,
+        short_memory=short_memory,
+    )
+    reduced_relations = _apply_reduced_relations_to_instances(
+        reduced_relations,
+        reduced_tags,
         short_memory=short_memory,
     )
     reduced_tokens, reduced_tags = _reduce_helper_tokens(

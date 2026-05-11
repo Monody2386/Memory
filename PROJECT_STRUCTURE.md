@@ -52,6 +52,17 @@ root-level compatibility wrappers.
 - `prototype/adj.py`
   Small embedding-adjustment experiment.
 
+### `demo/`
+
+- `demo/world/`
+  Runnable demos for world-model updates, short-memory training, text-to-world training, and consciousness/world interaction.
+- `demo/prototype/`
+  Runnable demos for the high-level command pipeline, grammar pipeline, question learning, and emotion prediction.
+- `demo/reward/`
+  Runnable demos for standalone reward prediction and subject-event reward prediction.
+- `demo/surprise/`
+  Runnable demos for subject-event surprise prediction.
+
 ## Saved Data
 
 - `relation_data.npz`
@@ -64,11 +75,14 @@ root-level compatibility wrappers.
 - Legacy file names such as `Knowledge_map.py`, `World_model.py`, and `Consciousness.py` are still present at the repo root.
 - They now re-export the packaged implementations so existing scripts and IDE tabs keep working during the transition.
 - `train_relation_map.py` and `Feed_relations.py` remain compatibility shims for older imports.
+- Legacy demo paths such as `Demo_world_updates.py`, `world/demo_*.py`, `prototype/demo_*.py`,
+  `reward/demo_*.py`, and `surprise/demo_*.py` now re-export the organized demos under `demo/`.
 
 ## Recommended Entry Points
 
 - Knowledge workflow: `knowledge/train_knowledge.py`
 - World-model workflow: `world/train_world_model.py`
+- Demos: `python -m demo.world.demo_world_updates` or the other modules under `demo/`.
 
 ## Current Cleanup Notes
 

@@ -82,6 +82,8 @@ class SpaceState:
     def __init__(self) -> None:
         self.facts: Set[SpatialFact] = set()
         self.out_edges_by_source: Dict[str, Set[SpatialFact]] = {}
+
+        
         self.in_edges_by_target: Dict[str, Set[SpatialFact]] = {}
         self.edges_by_relation: Dict[str, Set[SpatialFact]] = {}
 
